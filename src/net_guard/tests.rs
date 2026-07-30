@@ -73,8 +73,32 @@ fn errors_mask_embedded_userinfo() {
         "SSRF error leaked userinfo: {err}"
     );
     assert_eq!(
-        mask_userinfo("https://svc:hunter2@host/p?q=1"),
+        mask_userinfo(&url("https://svc:hunter2@host/p?q=1")),
         "https://***@host/p?q=1"
     );
-    assert_eq!(mask_userinfo("https://host/p"), "https://host/p");
+    assert_eq!(mask_userinfo(&url("https://host/p")), "https://host/p");
+}
+
+/// Regression for the TAB-in-scheme-separator masking bypass: WHATWG URL parsing (which
+/// `reqwest::Url::parse` uses, same as the real HTTP client) strips embedded TAB/CR/LF before the
+/// scheme separator, so `"https:\t//svc:hunter2@10.0.0.1/route"` parses and resolves completely
+/// normally to host `10.0.0.1` with userinfo `svc:hunter2` — even though the literal substring
+/// `"://"` never appears in the raw string. A masking function keyed on `raw.find("://")` would
+/// silently no-op here and leak `hunter2` verbatim into the SSRF-rejection error. Assert BOTH that the
+/// credential never reaches the error string AND that the URL was actually recognized as targeting the
+/// blocked host (i.e. this is exercising the real SSRF-rejection path, not an early scheme-parse bail).
+#[test]
+fn mask_userinfo_survives_tab_in_scheme_separator() {
+    let raw = "https:\t//svc:hunter2@10.0.0.1/route";
+    // Sanity: this raw string really does parse and really does resolve to the blocked host — proving
+    // the reproduction is real, not a URL that simply fails to parse.
+    let parsed = reqwest::Url::parse(raw).expect("WHATWG parsing accepts the embedded tab");
+    assert_eq!(parsed.host_str(), Some("10.0.0.1"));
+
+    let err = validate_target_url(raw).expect_err("10.0.0.1 must be SSRF-rejected");
+    assert!(
+        !err.contains("hunter2"),
+        "mask_userinfo must mask a TAB-obfuscated scheme separator too, got: {err}"
+    );
+    assert_eq!(mask_userinfo(&parsed), "https://***@10.0.0.1/route");
 }
