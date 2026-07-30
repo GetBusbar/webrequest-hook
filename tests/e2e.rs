@@ -100,12 +100,26 @@ async fn mock_target_bytes(status: u16, body: Vec<u8>) -> String {
 // ── The cdylib + loader glue ──────────────────────────────────────────────────────────────────────
 
 /// Locate the built `webrequest` cdylib in the target dir (mirrors the loader's hook_plugin_path).
+/// Under CI, a missing cdylib is a hard failure — this is the only over-the-ABI coverage of the
+/// `kind: hook` dlopen seam for this plugin (including the SSRF-guard-at-load and userinfo-masking
+/// tests) and must never silently skip there (see `busbar-auth-oidc-plugin`'s `tests/e2e.rs` for the
+/// same guard on the same seam).
 fn plugin_path() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let profile_dir = exe.parent()?.parent()?;
-    let name = busbar_plugin_loader::plugin_library_filename("busbar_webrequest_hook_plugin");
-    let candidate = profile_dir.join(&name);
-    candidate.exists().then_some(candidate)
+    let candidate = (|| {
+        let exe = std::env::current_exe().ok()?;
+        let profile_dir = exe.parent()?.parent()?;
+        let name = busbar_plugin_loader::plugin_library_filename("busbar_webrequest_hook_plugin");
+        let candidate = profile_dir.join(&name);
+        candidate.exists().then_some(candidate)
+    })();
+    if candidate.is_none() && std::env::var_os("CI").is_some() {
+        panic!(
+            "the webrequest-hook plugin cdylib is not built under CI: `cargo test --workspace` \
+             must build busbar_webrequest_hook_plugin. Refusing to silently skip the only \
+             over-the-ABI coverage of the kind:hook dlopen seam."
+        );
+    }
+    candidate
 }
 
 /// The engine-side projectors: the same tiny fail-closed shims the loader's own hook test uses
