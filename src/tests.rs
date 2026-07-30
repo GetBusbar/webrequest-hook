@@ -125,6 +125,35 @@ fn configure_revalidates_pushed_url() {
     );
 }
 
+/// An operator-supplied `timeout_ms` is clamped to `[1, MAX_TIMEOUT_MS]` — MAX_TIMEOUT_MS must not
+/// meaningfully exceed the engine's reference hook budget (see its doc comment), so a fat-fingered
+/// huge value cannot pin the process-wide hook FFI permit for far longer than the engine itself
+/// budgets for one hook call.
+#[test]
+fn timeout_ms_is_clamped_to_max_timeout_ms() {
+    let fwd = Forwarder::new(Config {
+        url: "https://api.example.com/route".to_string(),
+        timeout_ms: Some(60_000),
+    })
+    .expect("valid config");
+    assert_eq!(
+        fwd.timeout,
+        Duration::from_millis(MAX_TIMEOUT_MS),
+        "an oversized timeout_ms must clamp to MAX_TIMEOUT_MS, not pass through"
+    );
+
+    let fwd = Forwarder::new(Config {
+        url: "https://api.example.com/route".to_string(),
+        timeout_ms: Some(0),
+    })
+    .expect("valid config");
+    assert_eq!(
+        fwd.timeout,
+        Duration::from_millis(1),
+        "a zero timeout_ms must clamp up to the 1ms floor"
+    );
+}
+
 /// Dropping a `Forwarder` from INSIDE an async context (a tokio worker thread) must NOT panic.
 /// This reproduces the hot-reload drop path: on config reload the last `Arc<App>` — and this
 /// forwarder with it — can drop on a tokio async thread. A bare `Runtime` dropped there panics

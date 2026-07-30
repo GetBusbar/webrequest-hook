@@ -113,7 +113,7 @@ for the `hooks:` wiring (`kind: hook`, `settings: { url: ... }`).
 | Setting | Required | Default | Notes |
 |---|---|---|---|
 | `url` | yes | — | The `https://` (or loopback `http://`) URL each hook op envelope is POSTed to. Validated against the SSRF guard at load and on every `configure` push. |
-| `timeout_ms` | no | `5000` | Per-op wall-clock timeout, clamped to `[1, 60000]`. |
+| `timeout_ms` | no | `5000` | Per-op wall-clock timeout, clamped to `[1, 5000]` — cannot exceed the engine's reference hook budget, since a hook FFI call holds a process-wide permit until the blocking call returns (see `MAX_TIMEOUT_MS`'s doc comment in `src/lib.rs`). |
 
 ## Tests
 
