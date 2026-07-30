@@ -1,116 +1,155 @@
-# Build the webrequest-hook cdylib for each supported target and publish the raw libraries as
-# assets on a GitHub Release. Triggered by pushing a tag like `v1.5.0`.
+# Release: on a version tag (e.g. v1.0.0), build the webrequest-hook plugin cdylib for all 5
+# supported targets, pack + sign each into a loadable busbar plugin tarball, and publish them to
+# THIS repo's own GitHub Release.
 #
-# NOTE: this only builds and uploads the UNSIGNED cdylib. Busbar only loads a signed manifest+cdylib
-# tarball (see docs/plugins.md in busbarAI, "Signing and packaging") — packing/signing needs
-# `busbar-plugin-pack` (a busbarAI-crate tool) and the BUSBAR_SIGN_KEY release secret, both of which
-# currently live in the monorepo, not here. Until busbarAI is public and this workflow can pull
-# busbar-plugin-pack as a real dependency, packing + signing is a manual follow-up step run from a
-# busbarAI checkout against the artifacts this workflow produces. This job exists so a signer always
-# has a reproducible, CI-built binary to sign rather than a local one.
+# This mirrors busbarAI/.github/workflows/release.yml's `auth-plugins` job (and the identical
+# pattern GetBusbar/auth-oidc and GetBusbar/headroom-hook use) — same 5-target matrix, same
+# busbar-plugin-pack pack/sign step (built from a sibling busbar checkout), same
+# BUSBAR_SIGN_KEY-or-`--allow-unsigned` fallback, same `gh release upload` + build-provenance
+# attestation — just scoped to this one plugin.
+#
+# REPLACES the old stopgap workflow, which only built and uploaded the UNSIGNED raw cdylib
+# (busbar-plugin-pack lived only in the still-private busbarAI monorepo at the time, so
+# packing/signing was a manual follow-up step against this workflow's artifacts). busbar-plugin-pack
+# is built here from a sibling busbar checkout instead, exactly like every other first-party plugin
+# repo, so this workflow now produces the real signed, loadable tarball directly.
+#
+# This plugin's own version (the `v*` tag pushed here) is NOT tied to busbar's version number —
+# see other first-party plugin repos for the same convention.
 name: release
 
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch: {}
 
 permissions:
-  contents: write   # create the release + upload assets
+  contents: write      # create the Release + upload assets
+  id-token: write      # OIDC identity for keyless Sigstore signing (provenance)
+  attestations: write  # record the build-provenance attestation
+
+env:
+  # Which busbar branch to check out as the sibling path dependency — same BUSBAR_REF convention
+  # this repo's own ci.yml already established. Update to `main` once busbar 1.5.0 actually ships;
+  # until then the plugin ABI surface this crate depends on only exists on 1.5.0-dev.
+  BUSBAR_REF: 1.5.0-dev
 
 jobs:
-  build:
-    name: build ${{ matrix.target }}
+  # Create the Release first so the parallel per-target upload jobs have something to attach to
+  # (uploading from a matrix without a pre-existing release races -> "release not found").
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "busbar-webrequest ${GITHUB_REF_NAME}" \
+            --verify-tag --generate-notes \
+          || gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}"
+
+  # One signed .tar.gz per target: {cdylib + manifest.json}, packed by busbar-plugin-pack and
+  # signed with the busbar release PRIVATE key (BUSBAR_SIGN_KEY secret) so it verifies as
+  # first-party against the PUBLIC key embedded in busbar's own release binaries. If that secret
+  # isn't provisioned on this repo, falls back to an UNSIGNED tarball (loadable only under
+  # plugins.trust.allow_unsigned) rather than blocking the release — same seam every other
+  # first-party plugin's release.yml documents.
+  webrequest-plugin:
+    needs: create-release
+    name: webrequest-plugin (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            lib_name: libbusbar_webrequest_hook_plugin.so
-            asset: webrequest-hook-plugin-linux-x86_64.so
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            lib_name: libbusbar_webrequest_hook_plugin.so
-            asset: webrequest-hook-plugin-linux-aarch64.so
-          - os: macos-14
-            target: aarch64-apple-darwin
-            lib_name: libbusbar_webrequest_hook_plugin.dylib
-            asset: webrequest-hook-plugin-macos-arm64.dylib
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            libext: so
+            libprefix: lib
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            libext: so
+            libprefix: lib
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            libext: dylib
+            libprefix: lib
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            libext: dylib
+            libprefix: lib
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            libext: dll
+            libprefix: ""
     steps:
       - name: Checkout webrequest-hook
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: webrequest-hook
 
-      - name: Checkout busbarAI (sibling path dependency)
-        uses: actions/checkout@v4
+      - name: Checkout busbar (sibling path dependency)
+        uses: actions/checkout@v7
         with:
-          repository: GetBusbar/busbarAI
-          ref: main
-          token: ${{ secrets.BUSBARAI_CHECKOUT_TOKEN }}
+          repository: GetBusbar/busbar
+          ref: ${{ env.BUSBAR_REF }}
           path: busbarAI
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Build (release)
+      - name: Build the webrequest-hook plugin cdylib
         working-directory: webrequest-hook
         run: cargo build --release --locked --lib --target ${{ matrix.target }}
+        shell: bash
 
-      - name: Stage library
-        working-directory: webrequest-hook
+      - name: Build busbar-plugin-pack (from the sibling busbar checkout)
+        working-directory: busbarAI
+        run: cargo build --release --target ${{ matrix.target }} -p busbar-plugin-pack
+        shell: bash
+
+      - name: Package + sign the plugin tarball
+        env:
+          BUSBAR_SIGN_KEY: ${{ secrets.BUSBAR_SIGN_KEY }}
         run: |
-          install -m 0644 "target/${{ matrix.target }}/release/${{ matrix.lib_name }}" "${{ matrix.asset }}"
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          target="${{ matrix.target }}"
+          outdir="plugin-dist"; mkdir -p "$outdir"
+          pack="busbarAI/target/${target}/release/busbar-plugin-pack"
+          [ -x "$pack" ] || pack="busbarAI/target/${target}/release/busbar-plugin-pack.exe"
+          unsigned_flag=""
+          if [ -z "${BUSBAR_SIGN_KEY:-}" ]; then
+            echo "::warning::BUSBAR_SIGN_KEY secret is not provisioned — packaging an UNSIGNED plugin tarball (loadable only under plugins.trust.allow_unsigned). See busbarAI's release.yml TODO(release-keys) seam."
+            unsigned_flag="--allow-unsigned"
+          fi
+          lib="webrequest-hook/target/${target}/release/${{ matrix.libprefix }}busbar_webrequest_hook_plugin.${{ matrix.libext }}"
+          "$pack" pack \
+            --lib "$lib" \
+            --name "busbar-webrequest" --alias "webrequest" --kind hook \
+            --version "$ver" --publisher busbar \
+            --description "A transparent HTTP forwarder that POSTs each hook op envelope (decide/transform/notify/configure/describe/status) to an operator-configured URL and returns the capped JSON reply — a busbar first-party kind:hook plugin (dlopen cdylib)." \
+            --license Apache-2.0 \
+            --needs-prompt rw --needs-user ro \
+            --out "${outdir}/busbar-webrequest-${ver}-${target}.tar.gz" \
+            $unsigned_flag
+          ls -l "$outdir"
+        shell: bash
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+      - name: Attach plugin tarball to Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${GITHUB_REF_NAME}" plugin-dist/*.tar.gz --repo "${GITHUB_REPOSITORY}" --clobber
+        shell: bash
+
+      # Keyless (Sigstore/OIDC) build-provenance attestation binding this tarball's digest to this
+      # workflow run + commit — `gh attestation verify <tarball> --repo ${{ github.repository }}`.
+      - name: Attest plugin build provenance
+        uses: actions/attest-build-provenance@v4
         with:
-          name: ${{ matrix.asset }}
-          path: webrequest-hook/${{ matrix.asset }}
-          if-no-files-found: error
-
-  release:
-    name: publish release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all libraries
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Checksums
-        run: |
-          cd dist
-          sha256sum webrequest-hook-plugin-* > SHA256SUMS
-          cat SHA256SUMS
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/webrequest-hook-plugin-*
-            dist/SHA256SUMS
-          body: |
-            Prebuilt (UNSIGNED) `webrequest-hook` plugin cdylibs for busbar's `kind: hook` plugin
-            loader.
-
-            These are raw libraries, not a loadable plugin tarball — pack and sign one with
-            `busbar-plugin-pack` (from a busbarAI checkout) before dropping it into busbar's
-            `plugins.dir`:
-
-            ```sh
-            BUSBAR_SIGN_KEY=... busbar-plugin-pack pack \
-              --lib webrequest-hook-plugin-linux-x86_64.so \
-              --name busbar-webrequest-hook-plugin --alias webrequest --kind hook \
-              --version ${{ github.ref_name }} --publisher busbar \
-              --license Apache-2.0 --needs-prompt rw --needs-user ro \
-              --out busbar-webrequest-hook-plugin-${{ github.ref_name }}-x86_64-linux.tar.gz
-            ```
-
-            Verify the raw library with `sha256sum -c SHA256SUMS` before signing.
+          subject-path: "plugin-dist/*.tar.gz"
