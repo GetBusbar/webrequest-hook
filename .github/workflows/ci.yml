@@ -1,10 +1,11 @@
 # Build, test, lint, and format-check the webrequest-hook plugin cdylib on every push/PR.
 #
-# NOTE: this crate depends on busbarAI (../busbarAI, a local path dependency — see the README's
-# "Dependencies" section) which is not yet a public repo, so CI cannot check it out as a public
-# dependency. Until busbarAI ships publicly, this workflow checks out both repos side by side using
-# a deploy-key-scoped or org-token checkout of busbarAI. Update BUSBARAI_REF as the pinned busbarAI
-# commit/branch this plugin builds against moves.
+# This crate depends on busbar (../busbarAI, a local path dependency — see the README's
+# "Dependencies" section). The busbar repo (GetBusbar/busbar) is public, but 1.5.0's plugin work
+# (this crate's actual dependency surface — plugin-sdk, plugin-loader, api) isn't on `main` yet
+# (still pre-release); it lives on the `1.5.0-dev` branch instead, checked out here with no token
+# needed since the repo itself is public. Update BUSBAR_REF once 1.5.0 ships and this can just
+# track `main`.
 name: ci
 
 on:
@@ -14,7 +15,7 @@ on:
     branches: [main]
 
 env:
-  BUSBARAI_REF: main
+  BUSBAR_REF: 1.5.0-dev
 
 jobs:
   test:
@@ -26,15 +27,11 @@ jobs:
         with:
           path: webrequest-hook
 
-      - name: Checkout busbarAI (sibling path dependency)
+      - name: Checkout busbar (sibling path dependency)
         uses: actions/checkout@v4
         with:
-          repository: GetBusbar/busbarAI
-          ref: ${{ env.BUSBARAI_REF }}
-          # TODO: busbarAI is private today — set the BUSBARAI_CHECKOUT_TOKEN repo secret to a
-          # token/deploy-key with read access before enabling this job. Once busbarAI is public,
-          # drop this token line entirely.
-          token: ${{ secrets.BUSBARAI_CHECKOUT_TOKEN }}
+          repository: GetBusbar/busbar
+          ref: ${{ env.BUSBAR_REF }}
           path: busbarAI
 
       - name: Install Rust
