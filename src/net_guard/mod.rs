@@ -26,7 +26,16 @@
 //! security atoms are copied here. The design spec explicitly calls for the SSRF guard to LIVE in this
 //! plugin. If these are ever hoisted into a tiny no-dep shared leaf crate, this copy should reference
 //! it; until then the copies must be kept byte-identical — a contributor hardening one against a new
-//! obfuscation form must harden both. The tests below pin the shared behaviour so drift is caught.
+//! obfuscation form must harden both. The tests below pin THIS COPY's behaviour against fixed test
+//! vectors (obfuscated-encoding forms, RFC1918/CGNAT/ULA/link-local/metadata hosts, the loopback
+//! carve-out); they do NOT diff against the core copy in `busbar/src/net_guard.rs`, so drift between
+//! the two copies would not by itself turn any test here red — keeping the two byte-identical is a
+//! manual review discipline at PR time, not something this test module enforces automatically.
+//!
+//! Note also: these predicates validate the URL's literal host (or its already-resolved IP) at
+//! open/configure time; they do not re-check DNS resolution at connect time, so a host that resolves
+//! to an allowed IP at validation and to a blocked internal IP later (DNS rebinding / TOCTOU) is not
+//! defended against here.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -219,14 +228,14 @@ pub(crate) fn validate_target_url(raw: &str) -> Result<reqwest::Url, String> {
     if !(scheme_is(&url, "https") || scheme_is(&url, "http")) {
         return Err(format!(
             "webrequest: settings.url must be an http:// or https:// URL (got '{}')",
-            mask_userinfo(raw)
+            mask_userinfo(&url)
         ));
     }
     if host_is_blocked(&url) {
         return Err(format!(
             "webrequest: settings.url must not target a link-local/private/CGNAT/cloud-metadata host \
              (SSRF guard; loopback sidecars are allowed); got '{}'",
-            mask_userinfo(raw)
+            mask_userinfo(&url)
         ));
     }
     if scheme_is(&url, "http") && !host_is_loopback(&url) {
@@ -234,30 +243,35 @@ pub(crate) fn validate_target_url(raw: &str) -> Result<reqwest::Url, String> {
             "webrequest: settings.url must use https:// for a non-loopback target (plaintext http:// is \
              only permitted for a loopback sidecar; the payload could otherwise be sent in cleartext); \
              got '{}'",
-            mask_userinfo(raw)
+            mask_userinfo(&url)
         ));
     }
     Ok(url)
 }
 
-/// Replace any `user[:pass]@` userinfo in a URL-ish string with `***@` so a credential embedded in the
-/// operator's URL never reaches a (logged) error message. Best-effort textual mask on the raw input.
-pub(crate) fn mask_userinfo(raw: &str) -> String {
-    // Only the authority segment can carry userinfo: between `://` and the next `/`, `?`, or `#`.
-    let Some(scheme_end) = raw.find("://") else {
-        return raw.to_string();
-    };
-    let auth_start = scheme_end + 3;
-    let rest = &raw[auth_start..];
-    let auth_end = rest
-        .find(['/', '?', '#'])
-        .map(|i| auth_start + i)
-        .unwrap_or(raw.len());
-    let authority = &raw[auth_start..auth_end];
-    match authority.rfind('@') {
-        Some(at) => format!("{}***@{}", &raw[..auth_start], &raw[auth_start + at + 1..]),
-        None => raw.to_string(),
+/// Replace any `user[:pass]@` userinfo on `url` with `***@` so a credential embedded in the operator's
+/// URL never reaches a (logged) error message.
+///
+/// Operates on the ALREADY-PARSED [`reqwest::Url`] rather than doing textual `find("://")` surgery on
+/// the raw input string. This matters: WHATWG URL parsing (which both `reqwest::Url::parse` and every
+/// real HTTP client use) silently strips embedded TAB/CR/LF from a URL before establishing the scheme
+/// separator, so a raw string like `"https:\t//svc:hunter2@10.0.0.1/route"` parses and connects
+/// completely normally (host `10.0.0.1`, userinfo `svc:hunter2`) even though the LITERAL substring
+/// `"://"` never appears in it. A textual mask keyed on `raw.find("://")` misses that case entirely —
+/// it is a silent no-op — and the unmasked credential then lands verbatim in the SSRF-rejection error
+/// string. Masking the parsed `Url`'s username/password fields directly is correct regardless of what
+/// whitespace or control characters the raw input used to spell the scheme separator.
+pub(crate) fn mask_userinfo(url: &reqwest::Url) -> String {
+    if url.username().is_empty() && url.password().is_none() {
+        return url.to_string();
     }
+    let mut masked = url.clone();
+    // `set_username`/`set_password` fail only for cannot-be-a-base URLs (e.g. `mailto:`), which never
+    // reach here (the scheme is already checked to be http/https) — the error is not actionable if it
+    // ever did occur, so it's fine to ignore.
+    let _ = masked.set_password(None);
+    let _ = masked.set_username("***");
+    masked.to_string()
 }
 
 #[cfg(test)]

@@ -55,6 +55,17 @@ const MAX_REPLY_DEPTH: usize = 128;
 /// gate is on the request path, so a slow target must fail fast (→ the engine coerces to `on_error`).
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 
+/// Upper bound an operator-supplied `timeout_ms` is clamped to. Deliberately equal to
+/// [`DEFAULT_TIMEOUT_MS`] — the engine's reference hook budget is 5s, and hook FFI calls are gated by
+/// a process-wide, fixed-size semaphore permit that is released only when the blocking `busbar_call`
+/// closure RETURNS, not when the caller gives up waiting on its own deadline. If this were allowed up
+/// to (say) 60s, an operator setting a large `timeout_ms` would let one slow target hold a permit for
+/// up to ~55s past every OTHER caller's deadline, starving hook execution process-wide for every other
+/// plugin — a single misconfigured `webrequest` target should never be able to do that. Keeping the
+/// ceiling at the reference hook budget means a fat-fingered large value can, at worst, make this
+/// specific op run exactly as long as the engine already budgets for a hook, never past it.
+const MAX_TIMEOUT_MS: u64 = DEFAULT_TIMEOUT_MS;
+
 /// The plugin's `settings` config (the operator-owned `settings:` map the engine passes at `open`, and
 /// re-pushes on `configure`).
 #[derive(Deserialize, Default)]
@@ -83,6 +94,19 @@ struct Forwarder {
     // be caught by the SDK's `ffi_guard`, and LEAK the runtime + reqwest client every reload. Instead
     // `Drop` takes the runtime and calls `shutdown_background()`, which never blocks. Always `Some`
     // between construction and drop.
+    //
+    // KNOWN HAZARD (documented, not fixed here): `shutdown_background()` detaches teardown onto a
+    // background thread and returns immediately — `Drop` does not wait for that thread to finish. If
+    // the engine ever `dlclose`s this cdylib right after dropping the last `Forwarder` (rather than
+    // only at process exit), that detached thread can end up executing code/vtables that belonged to
+    // the now-unloaded library — a use-after-free-adjacent hazard. A bounded join (or a shutdown flag
+    // plus a short blocking join) would close this, but doing so safely requires either joining from a
+    // context where blocking is provably allowed (the whole reason `shutdown_background` is used here
+    // instead of a blocking `Runtime::drop` is that `Drop` can run on a tokio worker thread where
+    // blocking is FORBIDDEN and would panic — see above) or restructuring how/where teardown happens.
+    // That's a deeper change than this fix pass attempts; flagged here for whoever next touches
+    // reload/unload behavior, and tracked as a known LOW-probability (dlclose-on-hot-reload is not
+    // this loader's current behavior) but real hazard if that ever changes.
     rt: Option<tokio::runtime::Runtime>,
 }
 
@@ -106,12 +130,13 @@ impl Forwarder {
             return Err("webrequest: settings.url is required".to_string());
         }
         let url = net_guard::validate_target_url(&cfg.url)?;
-        // Bound the operator timeout to [1ms, 60s] — a gate that could block the request path for
-        // minutes is a foot-gun, not a feature.
+        // Bound the operator timeout to [1ms, MAX_TIMEOUT_MS] — a gate that could block the request
+        // path past the engine's own hook budget is a foot-gun (and a process-wide permit-starvation
+        // hazard, see MAX_TIMEOUT_MS's doc comment), not a feature.
         let timeout_ms = cfg
             .timeout_ms
             .unwrap_or(DEFAULT_TIMEOUT_MS)
-            .clamp(1, 60_000);
+            .clamp(1, MAX_TIMEOUT_MS);
         let client = reqwest::Client::builder()
             // Disable redirects so a target cannot 30x us onto an internal host at runtime (the
             // validated URL only guarantees the FIRST hop is safe).
@@ -132,12 +157,19 @@ impl Forwarder {
         })
     }
 
-    /// POST the op `envelope` to the target and return the parsed reply `Value`. Bounded by `timeout`,
-    /// redirect-disabled, body capped before allocation and depth-guarded before parse. Any error is a
-    /// stable, userinfo-masked string — the caller degrades it to the safe reply for the op (the engine
-    /// then fails open/closed exactly as it does for the retired transports).
-    fn post_op(&self, envelope: &serde_json::Value) -> Result<serde_json::Value, String> {
-        let body = serde_json::to_vec(envelope)
+    /// POST the `op` envelope (the engine's `payload` projection plus the `op` discriminator) to the
+    /// target and return the parsed reply `Value`. Bounded by `timeout`, redirect-disabled, body capped
+    /// before allocation and depth-guarded before parse. Any error is a stable, userinfo-masked string —
+    /// the caller degrades it to the safe reply for the op (the engine then fails open/closed exactly as
+    /// it does for the retired transports).
+    ///
+    /// Serializes straight from the borrowed `payload` via [`Envelope`]'s hand-written `Serialize`
+    /// rather than first cloning it into an owned `Map` just to splice in the `op` key — this runs on
+    /// every `decide`/`transform`/`notify` call on the request hot path, so avoiding a full deep clone
+    /// of the (potentially prompt-carrying) projected payload on every call is worth the small amount of
+    /// hand-written serialization code.
+    fn post_op(&self, op: &str, payload: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let body = serde_json::to_vec(&Envelope { op, payload })
             .map_err(|e| format!("webrequest: failed to serialize op envelope: {e}"))?;
         // Safe: `rt` is `Some` for the whole lifetime between `new` and `Drop` (only `Drop` takes it).
         let rt = self
@@ -235,22 +267,51 @@ fn exceeds_max_depth(bytes: &[u8], max: usize) -> bool {
     false
 }
 
-/// Build the POST envelope for a per-request op: the engine's opaque `payload` projection with an `op`
-/// discriminator merged in, mirroring the old webhook wire (`{op, request, candidates, context, ...}`).
-/// The projection is carried through UNCHANGED — the forwarder never inspects or mutates it, so any
-/// opt-in `prompt`/`user` keys the CORE granted ride straight through to the target.
-fn request_envelope(op: &str, payload: &serde_json::Value) -> serde_json::Value {
-    let mut obj = match payload {
-        serde_json::Value::Object(m) => m.clone(),
-        // A non-object projection is unexpected, but relay it under a `payload` key rather than dropping.
-        other => {
-            let mut m = serde_json::Map::new();
-            m.insert("payload".to_string(), other.clone());
-            m
+/// The POST envelope for a per-request op: the engine's opaque `payload` projection (BORROWED, not
+/// cloned) with an `op` discriminator merged in on the wire, mirroring the old webhook wire (`{op,
+/// request, candidates, context, ...}`). The projection is carried through UNCHANGED — the forwarder
+/// never inspects or mutates it, so any opt-in `prompt`/`user` keys the CORE granted ride straight
+/// through to the target. `Serialize` is hand-written (see impl below) so `post_op` can serialize
+/// straight from `&Forwarder`'s borrowed `payload` reference without first cloning it into an owned
+/// `Map` just to splice in `op` — see [`Forwarder::post_op`]'s doc comment for why that matters.
+struct Envelope<'a> {
+    op: &'a str,
+    payload: &'a serde_json::Value,
+}
+
+impl serde::Serialize for Envelope<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        match self.payload {
+            serde_json::Value::Object(m) => {
+                let mut map = serializer.serialize_map(Some(m.len() + 1))?;
+                for (k, v) in m {
+                    map.serialize_entry(k, v)?;
+                }
+                map.serialize_entry("op", self.op)?;
+                map.end()
+            }
+            // A non-object projection is unexpected, but relay it under a `payload` key rather than
+            // dropping it.
+            other => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("payload", other)?;
+                map.serialize_entry("op", self.op)?;
+                map.end()
+            }
         }
-    };
-    obj.insert("op".to_string(), serde_json::Value::String(op.to_string()));
-    serde_json::Value::Object(obj)
+    }
+}
+
+/// Build the POST envelope for a per-request op as an OWNED [`serde_json::Value`] — the same wire shape
+/// [`Envelope`] serializes, used where an owned/indexable `Value` is actually wanted (currently: the
+/// unit test asserting the envelope's shape). NOT on the hot per-call path; see [`Envelope`] for that.
+#[cfg(test)]
+fn request_envelope(op: &str, payload: &serde_json::Value) -> serde_json::Value {
+    serde_json::to_value(Envelope { op, payload }).expect("envelope always serializes")
 }
 
 impl HookHandler for Forwarder {
@@ -258,7 +319,7 @@ impl HookHandler for Forwarder {
     /// `{}` (abstain): the engine's normalizer maps that to `Abstain`, and the fail-closed
     /// on_error/on_empty chain takes over — the retired webhook's "no opinion on error" guarantee.
     fn decide(&self, payload: &serde_json::Value) -> serde_json::Value {
-        match self.post_op(&request_envelope("decide", payload)) {
+        match self.post_op("decide", payload) {
             Ok(reply) => reply,
             Err(_) => serde_json::json!({}),
         }
@@ -267,7 +328,7 @@ impl HookHandler for Forwarder {
     /// `transform` — POST the projection, return the reply verbatim. On error return `{}` (abstain →
     /// proceed with the ORIGINAL body); a parsed `reject` in the reply is honored by the engine.
     fn transform(&self, payload: &serde_json::Value) -> serde_json::Value {
-        match self.post_op(&request_envelope("transform", payload)) {
+        match self.post_op("transform", payload) {
             Ok(reply) => reply,
             Err(_) => serde_json::json!({}),
         }
@@ -276,7 +337,7 @@ impl HookHandler for Forwarder {
     /// `notify` — fire-and-forget POST of the tap projection. The reply is not read and every error is
     /// swallowed: a tap can NEVER delay or fail the served request.
     fn notify(&self, payload: &serde_json::Value) {
-        let _ = self.post_op(&request_envelope("notify", payload));
+        let _ = self.post_op("notify", payload);
     }
 
     /// `configure` — RE-VALIDATE the (possibly changed) `settings.url` against the SSRF guard, then ACK
@@ -290,7 +351,20 @@ impl HookHandler for Forwarder {
     ) -> bool {
         match settings.get("url").and_then(|v| v.as_str()) {
             // A pushed URL must still pass the guard. Missing url → nothing to re-check (ACK).
-            Some(url) => net_guard::validate_target_url(url).is_ok(),
+            Some(url) => match net_guard::validate_target_url(url) {
+                Ok(_) => true,
+                Err(reason) => {
+                    // The `HookHandler::configure` ABI contract is a bare `bool` ACK/NACK — there is no
+                    // return-message channel to thread the specific (already userinfo-masked) rejection
+                    // reason back to the operator through. This crate has no logging dependency (no
+                    // `log`/`tracing`, and the plugin-sdk exposes no host-side log bridge either) to add
+                    // one for; `eprintln!` to stderr is the only zero-dependency way to make the reason
+                    // discoverable rather than silently dropping it, so an operator whose reconfigure
+                    // NACKs at least has somewhere to look. See the audit's finding #6.
+                    eprintln!("webrequest: configure() rejected: {reason}");
+                    false
+                }
+            },
             None => true,
         }
     }
@@ -309,7 +383,7 @@ impl HookHandler for Forwarder {
                     },
                     "timeout_ms": {
                         "type": "integer",
-                        "description": "Per-op wall-clock timeout in milliseconds (default 5000, clamped to [1, 60000])."
+                        "description": "Per-op wall-clock timeout in milliseconds (default 5000, clamped to [1, 5000] — cannot exceed the engine's reference hook budget)."
                     }
                 }
             }

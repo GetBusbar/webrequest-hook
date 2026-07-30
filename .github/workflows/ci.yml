@@ -1,11 +1,8 @@
-# Build, test, lint, and format-check the webrequest-hook plugin cdylib on every push/PR.
-#
-# This crate depends on busbar (../busbarAI, a local path dependency — see the README's
-# "Dependencies" section). The busbar repo (GetBusbar/busbar) is public, but 1.5.0's plugin work
-# (this crate's actual dependency surface — plugin-sdk, plugin-loader, api) isn't on `main` yet
-# (still pre-release); it lives on the `1.5.0-dev` branch instead, checked out here with no token
-# needed since the repo itself is public. Update BUSBAR_REF once 1.5.0 ships and this can just
-# track `main`.
+# Calls the canonical plugin-ci reusable workflow (GetBusbar/busbar/.github/workflows/plugin-ci.yml)
+# instead of hand-copying build/test/signoff steps here — see that file for what actually runs.
+# This also gets us the SIGNOFF stage the old hand-written ci.yml never had: packing the plugin with
+# the real busbar-plugin-pack tool on every push, so a manifest/tarball packing regression is caught
+# in CI rather than first discovered at release time.
 name: ci
 
 on:
@@ -14,43 +11,11 @@ on:
   pull_request:
     branches: [main]
 
-env:
-  BUSBAR_REF: 1.5.0-dev
-
 jobs:
-  test:
-    name: build, test, clippy, fmt
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout webrequest-hook
-        uses: actions/checkout@v4
-        with:
-          path: webrequest-hook
-
-      - name: Checkout busbar (sibling path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: GetBusbar/busbar
-          ref: ${{ env.BUSBAR_REF }}
-          path: busbarAI
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-
-      - name: cargo fmt --check
-        working-directory: webrequest-hook
-        run: cargo fmt --all -- --check
-
-      - name: cargo build
-        working-directory: webrequest-hook
-        run: cargo build --all-targets
-
-      - name: cargo clippy
-        working-directory: webrequest-hook
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: cargo test
-        working-directory: webrequest-hook
-        run: cargo test
+  ci:
+    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@1.5.0-dev
+    with:
+      plugin_crate: busbar-webrequest-hook-plugin
+      plugin_kind: hook
+      plugin_alias: webrequest
+      service: none

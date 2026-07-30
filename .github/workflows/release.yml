@@ -29,10 +29,17 @@ permissions:
   attestations: write  # record the build-provenance attestation
 
 env:
-  # Which busbar branch to check out as the sibling path dependency — same BUSBAR_REF convention
-  # this repo's own ci.yml already established. Update to `main` once busbar 1.5.0 actually ships;
-  # until then the plugin ABI surface this crate depends on only exists on 1.5.0-dev.
-  BUSBAR_REF: 1.5.0-dev
+  # Which busbar commit to check out as the sibling path dependency. Pinned to a SHA on the
+  # 1.5.0-dev branch (NOT the mutable branch name) because this step also builds and runs
+  # busbar-plugin-pack in the same job that holds BUSBAR_SIGN_KEY (with id-token: write) — a
+  # mutable branch ref there would let anyone who can push to 1.5.0-dev reach this repo's signing
+  # key. Resolved 2026-07-30 via `gh api repos/GetBusbar/busbar/branches/1.5.0-dev`, which was also
+  # the tip at the time: ddc97f1e337098d6b3b8f6cba32573cf2d652d5f. Only crates/plugin-sdk,
+  # crates/plugin-loader, crates/api, and crates/plugin-pack are needed from this checkout — all
+  # present at this SHA. To bump deliberately: verify the new SHA still has crates/plugin-sdk,
+  # crates/plugin-loader, crates/api, and crates/plugin-pack, then update the SHA below and this
+  # comment (see busbar-auth-oidc's release.yml for the same convention this mirrors).
+  BUSBAR_REF: ddc97f1e337098d6b3b8f6cba32573cf2d652d5f
 
 jobs:
   # Create the Release first so the parallel per-target upload jobs have something to attach to
