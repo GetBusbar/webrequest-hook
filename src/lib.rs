@@ -94,6 +94,19 @@ struct Forwarder {
     // be caught by the SDK's `ffi_guard`, and LEAK the runtime + reqwest client every reload. Instead
     // `Drop` takes the runtime and calls `shutdown_background()`, which never blocks. Always `Some`
     // between construction and drop.
+    //
+    // KNOWN HAZARD (documented, not fixed here): `shutdown_background()` detaches teardown onto a
+    // background thread and returns immediately — `Drop` does not wait for that thread to finish. If
+    // the engine ever `dlclose`s this cdylib right after dropping the last `Forwarder` (rather than
+    // only at process exit), that detached thread can end up executing code/vtables that belonged to
+    // the now-unloaded library — a use-after-free-adjacent hazard. A bounded join (or a shutdown flag
+    // plus a short blocking join) would close this, but doing so safely requires either joining from a
+    // context where blocking is provably allowed (the whole reason `shutdown_background` is used here
+    // instead of a blocking `Runtime::drop` is that `Drop` can run on a tokio worker thread where
+    // blocking is FORBIDDEN and would panic — see above) or restructuring how/where teardown happens.
+    // That's a deeper change than this fix pass attempts; flagged here for whoever next touches
+    // reload/unload behavior, and tracked as a known LOW-probability (dlclose-on-hot-reload is not
+    // this loader's current behavior) but real hazard if that ever changes.
     rt: Option<tokio::runtime::Runtime>,
 }
 
