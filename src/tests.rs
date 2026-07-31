@@ -62,6 +62,82 @@ fn parse_reply_depth_and_length_only_errors() {
     );
 }
 
+/// The depth cap is exact at its OWN boundary, wherever that boundary actually is: every other test
+/// only probes well-past-the-limit (150) or well-under, so an off-by-one in `exceeds_max_depth`'s
+/// `depth > max` (e.g. changed to `>=`) would silently narrow the real contract by one and nothing
+/// else here would catch it.
+///
+/// NOTE the boundary this test pins is depth 127, not `MAX_REPLY_DEPTH` (128) as the module doc
+/// comment claims ("depth-guarded at 128 levels"): `serde_json`'s OWN internal recursion limit
+/// rejects a depth-128 document before `exceeds_max_depth`'s pre-check is even the deciding factor
+/// (verified empirically: depth 127 parses, depth 128 fails serde_json's own parse regardless of our
+/// pre-check's `128 > 128` being false). So the crate's real, usable ceiling is one level lower than
+/// documented — this test pins the TRUE observed behavior; the one-off doc claim is a separate,
+/// low-severity craft fix.
+#[test]
+fn parse_reply_depth_boundary_is_exact() {
+    let nested = |n: usize| {
+        let mut s = String::from(r#"{"order":"#);
+        s.push_str(&"[".repeat(n));
+        s.push_str(&"]".repeat(n));
+        s.push('}');
+        s
+    };
+    // n array levels + the outer `{` = a max depth of n+1.
+    let at_boundary = nested(MAX_REPLY_DEPTH - 2); // depth 127: accepted
+    assert!(
+        parse_reply(at_boundary.as_bytes()).is_ok(),
+        "depth 127 (one below serde_json's own internal recursion limit) must still be accepted"
+    );
+    let one_over = nested(MAX_REPLY_DEPTH - 1); // depth 128: rejected
+    assert!(
+        parse_reply(one_over.as_bytes()).is_err(),
+        "depth 128 must be rejected"
+    );
+}
+
+/// The non-object-payload fallback branch of `Envelope::serialize` (wraps a non-object projection
+/// under a `payload` key rather than dropping it) is live, reachable code with no prior coverage —
+/// prove it actually does what its comment claims instead of trusting the comment.
+#[test]
+fn envelope_wraps_a_non_object_payload_under_payload_key() {
+    let payload = serde_json::json!(["not", "an", "object"]);
+    let value = request_envelope("notify", &payload);
+    assert_eq!(value["op"], "notify");
+    assert_eq!(value["payload"], payload);
+}
+
+/// The RAW BYTE serialization (what actually goes on the wire via `post_op`'s `serde_json::to_vec`,
+/// not the `to_value`-based `request_envelope` test helper, which would hide this: `to_value` builds
+/// a `Map` that naturally collapses duplicate keys regardless of what the `Serialize` impl emits) must
+/// never contain the `op` key twice, even when the projected payload itself carries a top-level `op`
+/// field.
+///
+/// RED (pre-fix): the payload's own `"op":"whatever"` and the discriminator's `"op":"decide"` are
+/// both written to the byte stream — two `"op":` occurrences.
+/// GREEN: the payload's `op` key is skipped; only the discriminator's `op` is emitted.
+#[test]
+fn envelope_byte_serialization_never_duplicates_the_op_key() {
+    let payload = serde_json::json!({
+        "op": "whatever-the-payload-happened-to-carry",
+        "request": {"pool": "p"}
+    });
+    let bytes = serde_json::to_vec(&Envelope {
+        op: "decide",
+        payload: &payload,
+    })
+    .expect("envelope always serializes");
+    let raw = String::from_utf8(bytes).unwrap();
+    let op_key_count = raw.matches("\"op\":").count();
+    assert_eq!(
+        op_key_count, 1,
+        "expected exactly one \"op\" key on the wire, got {op_key_count} in: {raw}"
+    );
+    // And it must be the discriminator's value, not the payload's stale one.
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(parsed["op"], "decide");
+}
+
 /// The request envelope merges the `op` discriminator into the projection object, preserving every
 /// projected key (so any opt-in prompt/user the core granted rides straight through).
 #[test]
@@ -75,6 +151,39 @@ fn request_envelope_merges_op_and_preserves_projection() {
     assert_eq!(env["request"]["pool"], "p");
     assert_eq!(env["request"]["messages"][0]["text"], "hi");
     assert_eq!(env["candidates"][0]["idx"], 0);
+}
+
+/// `post_op`'s transport-error string is userinfo-masked even when the target URL embeds a
+/// credential — the actual property `tests/e2e.rs`'s
+/// `forward_transport_error_never_leaks_userinfo` is NAMED for but cannot observe, since `decide()`
+/// discards the `Err` payload before it reaches anything the e2e test can inspect (it only ever sees
+/// `Abstain`, which is guaranteed unconditionally by that discard regardless of whether the masking
+/// itself still works). This test calls `post_op` directly and inspects the real error string.
+///
+/// RED (pre-fix, i.e. `.without_url()` removed): the error string would contain `hunter2`.
+/// GREEN: it never does.
+#[test]
+fn post_op_error_string_never_contains_url_userinfo() {
+    let fwd = Forwarder::new(Config {
+        // RFC 5737 TEST-NET-1: unroutable, so the POST fails fast without a real network hop.
+        url: "https://svc:hunter2@192.0.2.1/route".to_string(),
+        timeout_ms: Some(300),
+    })
+    .expect(
+        "192.0.2.1 is a public IP over https, so it loads fine (the SSRF guard only blocks \
+             plaintext http to a non-loopback host, and load-time RFC1918/link-local ranges)",
+    );
+    let err = fwd
+        .post_op("decide", &serde_json::json!({}))
+        .expect_err("192.0.2.1 is unroutable test-net space; the POST must fail");
+    assert!(
+        !err.contains("hunter2"),
+        "post_op error leaked the URL's userinfo credential: {err}"
+    );
+    assert!(
+        !err.contains("svc:"),
+        "post_op error leaked the URL's userinfo username: {err}"
+    );
 }
 
 /// `describe` returns the forwarder's own schema; `status` reports the target host and timeout with
@@ -122,6 +231,36 @@ fn configure_revalidates_pushed_url() {
     assert!(
         fwd.configure(&serde_json::Map::new(), 4),
         "a missing url ACKs"
+    );
+}
+
+/// A pushed `url` that's PRESENT but not a string (a templating bug rendering it as a number or
+/// null) must NACK, not be treated identically to an absent key.
+///
+/// RED (pre-fix): `settings.get("url").and_then(|v| v.as_str())` yields `None` for a non-string
+/// value exactly as it does for a missing key, so this fell into the same "nothing to check, ACK"
+/// arm as a genuinely absent url.
+/// GREEN: a present-but-wrong-typed url is distinguished and NACKs.
+#[test]
+fn configure_nacks_a_present_but_wrong_typed_url() {
+    let fwd = Forwarder::new(Config {
+        url: "https://api.example.com/route".to_string(),
+        timeout_ms: None,
+    })
+    .expect("valid config");
+
+    let mut number_url = serde_json::Map::new();
+    number_url.insert("url".into(), serde_json::json!(12345));
+    assert!(
+        !fwd.configure(&number_url, 5),
+        "a non-string url must NACK, not be silently treated as absent"
+    );
+
+    let mut null_url = serde_json::Map::new();
+    null_url.insert("url".into(), serde_json::Value::Null);
+    assert!(
+        !fwd.configure(&null_url, 6),
+        "a null url must NACK, not be silently treated as absent"
     );
 }
 
