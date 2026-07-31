@@ -288,7 +288,13 @@ impl serde::Serialize for Envelope<'_> {
         match self.payload {
             serde_json::Value::Object(m) => {
                 let mut map = serializer.serialize_map(Some(m.len() + 1))?;
-                for (k, v) in m {
+                // The `op` discriminator always wins: if the projection itself ever carries a
+                // top-level `op` key (a future wire change, an operator-visible passthrough field),
+                // skip it here rather than emitting it twice — a duplicate JSON key is ambiguous on
+                // the wire (some parsers keep the first occurrence, some the last), and this crate's
+                // own `op` must be the one the target sees, matching v1.0.0's `request_envelope`
+                // (`obj.insert("op", ...)`, which overwrote rather than duplicated).
+                for (k, v) in m.iter().filter(|(k, _)| k.as_str() != "op") {
                     map.serialize_entry(k, v)?;
                 }
                 map.serialize_entry("op", self.op)?;
@@ -349,9 +355,17 @@ impl HookHandler for Forwarder {
         settings: &serde_json::Map<String, serde_json::Value>,
         _settings_version: u64,
     ) -> bool {
-        match settings.get("url").and_then(|v| v.as_str()) {
-            // A pushed URL must still pass the guard. Missing url → nothing to re-check (ACK).
-            Some(url) => match net_guard::validate_target_url(url) {
+        match settings.get("url") {
+            // Missing url → nothing to re-check (ACK).
+            None => true,
+            // Present but not a string (e.g. a templating bug renders it as a number or null) is a
+            // malformed push, not an absent one — treating the two identically would silently ACK a
+            // garbage config with no NACK signal for the operator to notice. NACK it explicitly.
+            Some(v) if v.as_str().is_none() => {
+                eprintln!("webrequest: configure() rejected: settings.url is present but not a string ({v})");
+                false
+            }
+            Some(v) => match net_guard::validate_target_url(v.as_str().expect("checked above")) {
                 Ok(_) => true,
                 Err(reason) => {
                     // The `HookHandler::configure` ABI contract is a bare `bool` ACK/NACK — there is no
@@ -360,12 +374,11 @@ impl HookHandler for Forwarder {
                     // `log`/`tracing`, and the plugin-sdk exposes no host-side log bridge either) to add
                     // one for; `eprintln!` to stderr is the only zero-dependency way to make the reason
                     // discoverable rather than silently dropping it, so an operator whose reconfigure
-                    // NACKs at least has somewhere to look. See the audit's finding #6.
+                    // NACKs at least has somewhere to look.
                     eprintln!("webrequest: configure() rejected: {reason}");
                     false
                 }
             },
-            None => true,
         }
     }
 

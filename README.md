@@ -33,8 +33,10 @@ and is loaded in-process by busbar over the signed hybrid plugin ABI —
 - **Redirects disabled** on the client (`redirect::none`): a target
   cannot 30x-redirect the plugin to an internal host at runtime.
 - **Tight timeouts**; the reply body is capped before allocation (64
-  KiB) and depth-guarded before parse (128 levels) — a hostile or buggy
-  target can neither exhaust memory nor blow the stack.
+  KiB) and depth-guarded before parse (127 levels — one below
+  serde_json's own internal recursion limit, which binds first) — a
+  hostile or buggy target can neither exhaust memory nor blow the
+  stack.
 - **Userinfo stripped** from every error string, so a `user:pass@`
   embedded in the operator's URL never reaches a logged error.
 - **Grants are core-enforced, never plugin-driven**: this forwarder only
