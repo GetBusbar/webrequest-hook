@@ -19,13 +19,20 @@ busbar-plugin-sdk = { path = "../busbarAI/crates/plugin-sdk" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The plugin owns the web call: its own async runtime + HTTP client. redirect::none is set on the
-# client so a target cannot 30x-redirect us to an internal host at runtime.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros"] }
+# client so a target cannot 30x-redirect us to an internal host at runtime. Production code only ever
+# builds a `new_current_thread()` runtime (see `Forwarder::new`), so `rt-multi-thread` is NOT listed
+# here — it would otherwise ship in the shipped release cdylib for no reason. It's still available to
+# `cargo test` (via the `[dev-dependencies]` copy below, which Cargo unifies with this one for any
+# build that includes dev-dependencies): `src/tests.rs`'s `drop_in_async_context_does_not_panic` test
+# needs a real multi-thread runtime to reproduce the hot-reload drop-on-a-tokio-worker-thread case.
+tokio = { version = "1", features = ["rt", "time", "macros"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 # A local mock HTTP server for the end-to-end forward tests (mirrors the old webhook.rs test harness).
 axum = { version = "0.8", features = ["http1"] }
+# `rt-multi-thread` here (not in `[dependencies]`) is what makes it available to `cargo test` (see the
+# comment on the `[dependencies]` tokio entry above) without shipping it in the release artifact.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
 # INTERIM local path deps, same rationale as busbar-plugin-sdk above — these are dev-only (the
 # end-to-end test loads the built cdylib over the real loader ABI seam), never shipped in the plugin
