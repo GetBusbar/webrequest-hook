@@ -104,22 +104,53 @@ async fn mock_target_bytes(status: u16, body: Vec<u8>) -> String {
 /// `kind: hook` dlopen seam for this plugin (including the SSRF-guard-at-load and userinfo-masking
 /// tests) and must never silently skip there (see `busbar-auth-oidc-plugin`'s `tests/e2e.rs` for the
 /// same guard on the same seam).
+///
+/// Checks BOTH `<profile_dir>/<name>` (the "uplifted" copy Cargo produces only when `[lib]` is a
+/// ROOT build target of the invocation, e.g. `cargo build --all-targets`) AND
+/// `<profile_dir>/deps/<name>` (the raw compiler output, refreshed on EVERY build that recompiles
+/// the lib, uplifted or not — a cdylib's filename in `deps/` is never hash-suffixed, since a single
+/// package produces at most one). A bare `cargo test` with no prior `--all-targets`/`--lib` build
+/// (exactly what `cargo mutants`'s default build step runs, and what a developer running `cargo
+/// test` alone locally gets) recompiles the mutated/edited source but does NOT uplift it — checking
+/// only `profile_dir` in that case silently finds a STALE (or absent) top-level copy and every test
+/// below no-ops via this function's `None` return, appearing to pass without exercising a single
+/// line of the real cdylib. Confirmed by hand: deleting both candidates and running the exact
+/// `cargo test` invocation `cargo-mutants` uses left `profile_dir` empty while `profile_dir/deps`
+/// held the freshly-built dylib. Preferring whichever candidate has the newer mtime (falling back to
+/// whichever exists) is correct regardless of which build step ran last.
 fn plugin_path() -> Option<std::path::PathBuf> {
     let candidate = (|| {
         let exe = std::env::current_exe().ok()?;
         let profile_dir = exe.parent()?.parent()?;
         let name = busbar_plugin_loader::plugin_library_filename("busbar_webrequest_hook_plugin");
-        let candidate = profile_dir.join(&name);
-        candidate.exists().then_some(candidate)
+        let uplifted = profile_dir.join(&name);
+        let raw = profile_dir.join("deps").join(&name);
+        newest_existing(&[uplifted, raw])
     })();
     if candidate.is_none() && std::env::var_os("CI").is_some() {
         panic!(
-            "the webrequest-hook plugin cdylib is not built under CI: `cargo test --workspace` \
-             must build busbar_webrequest_hook_plugin. Refusing to silently skip the only \
-             over-the-ABI coverage of the kind:hook dlopen seam."
+            "the webrequest-hook plugin cdylib is not built under CI: `cargo test` must build \
+             busbar_webrequest_hook_plugin (checked both the uplifted target dir and target/deps). \
+             Refusing to silently skip the only over-the-ABI coverage of the kind:hook dlopen seam."
         );
     }
     candidate
+}
+
+/// The existing candidate with the newest mtime (a missing/unreadable candidate is skipped, not an
+/// error) — `None` iff no candidate exists. See [`plugin_path`]'s doc comment for why "newest of
+/// several possible build-output locations" is the correct selection rule here.
+fn newest_existing(candidates: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    candidates
+        .iter()
+        .filter_map(|p| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .map(|mtime| (p.clone(), mtime))
+        })
+        .max_by_key(|(_, mtime)| *mtime)
+        .map(|(p, _)| p)
 }
 
 /// The engine-side projectors: the same tiny fail-closed shims the loader's own hook test uses

@@ -183,9 +183,11 @@ name = "busbar-webrequest-hook-plugin"
 version = "1.5.0"
 dependencies = [
  "axum",
+ "base64",
  "busbar-api",
  "busbar-plugin-loader",
  "busbar-plugin-sdk",
+ "busbar-plugin-sign",
  "reqwest",
  "serde",
  "serde_json",

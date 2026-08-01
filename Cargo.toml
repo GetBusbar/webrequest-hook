@@ -39,3 +39,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macro
 # artifact itself.
 busbar-plugin-loader = { path = "../busbarAI/crates/plugin-loader" }
 busbar-api = { path = "../busbarAI/crates/api" }
+# For `tests/full_stack_e2e.rs`: signs the plugin tarball in-process exactly like the real release
+# pipeline / `busbar-plugin-pack` does, so that test installs a GENUINELY signed artifact over the
+# real admin API rather than relying on `allow_unsigned`.
+busbar-plugin-sign = { path = "../busbarAI/crates/plugin-sign" }
+# Encodes the signed tarball into the admin API's `tarball_b64` JSON field (same crate/version the
+# engine's own admin tests use for the identical purpose).
+base64 = "0.22"
+# `full_stack_e2e.rs` drives the real admin + data-plane HTTP APIs with JSON bodies. The `json`
+# feature is added HERE (not in `[dependencies]`'s reqwest, which stays JSON-free) — Cargo unifies
+# the two entries for any build that includes dev-dependencies, so this never reaches the shipped
+# release cdylib.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
