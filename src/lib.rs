@@ -39,6 +39,7 @@ mod net_guard;
 
 use busbar_plugin_sdk::HookHandler;
 use serde::Deserialize;
+use std::sync::RwLock;
 use std::time::Duration;
 
 /// Maximum reply body accepted from the target, in bytes. Matches the old webhook transport's
@@ -78,14 +79,51 @@ struct Config {
     timeout_ms: Option<u64>,
 }
 
+/// The forwarding target: a validated URL and its wall-clock timeout, taken together so `configure`
+/// swaps both atomically (a caller never observes a new url paired with a stale timeout or vice versa).
+struct LiveTarget {
+    url: reqwest::Url,
+    timeout: Duration,
+}
+
+impl LiveTarget {
+    /// Validate a `Config` into a `LiveTarget`. Shared by `Forwarder::new` (the `open` path) and
+    /// `configure` (the live-reconfigure path) so both apply IDENTICAL SSRF/timeout rules — see
+    /// [`HookHandler::configure`]'s doc comment for why `configure` needs this too, not just `open`.
+    fn validate(cfg: &Config) -> Result<Self, String> {
+        if cfg.url.trim().is_empty() {
+            return Err("webrequest: settings.url is required".to_string());
+        }
+        let url = net_guard::validate_target_url(&cfg.url)?;
+        // Bound the operator timeout to [1ms, MAX_TIMEOUT_MS] — a gate that could block the request
+        // path past the engine's own hook budget is a foot-gun (and a process-wide permit-starvation
+        // hazard, see MAX_TIMEOUT_MS's doc comment), not a feature.
+        let timeout_ms = cfg
+            .timeout_ms
+            .unwrap_or(DEFAULT_TIMEOUT_MS)
+            .clamp(1, MAX_TIMEOUT_MS);
+        Ok(Self {
+            url,
+            timeout: Duration::from_millis(timeout_ms),
+        })
+    }
+}
+
 /// The live forwarder: a validated target URL, its own `reqwest::Client` (redirect-disabled), and a
 /// dedicated current-thread tokio runtime to drive the async HTTP call from the SYNC `HookHandler`
 /// methods (the engine already runs each `busbar_call` on its own `spawn_blocking` thread, so blocking
 /// here never touches the engine's runtime workers).
 struct Forwarder {
-    url: reqwest::Url,
+    // `RwLock`, not a plain field: `configure` (see its doc comment) REPLACES this on a committed
+    // settings push, and `post_op`/`status` read it on every call from potentially-concurrent
+    // `spawn_blocking` threads (the engine gates up to `MAX_INFLIGHT_HOOK_CALLS` calls in flight at
+    // once). Read-mostly (many decide/transform/notify readers, an occasional configure writer), so a
+    // `RwLock` over a `Mutex`. A poisoned lock (a panic while holding the write half, which nothing in
+    // the critical section below can actually cause) is recovered from rather than propagated — a
+    // long-lived singleton plugin instance must not brick itself for its remaining lifetime over a
+    // panic in an unrelated call.
+    live: RwLock<LiveTarget>,
     client: reqwest::Client,
-    timeout: Duration,
     // Wrapped in `Option` SOLELY so `Drop` can move the runtime out and shut it down NON-blockingly.
     // A bare `tokio::runtime::Runtime` dropped in place runs its blocking `Drop`, which PANICS when
     // the drop happens on a tokio worker thread ("Cannot drop a runtime in a context where blocking
@@ -126,22 +164,20 @@ impl Forwarder {
     /// Build a forwarder from validated config. Fails closed if the URL is missing, malformed, blocked
     /// by the SSRF guard, or the client/runtime cannot be built.
     fn new(cfg: Config) -> Result<Self, String> {
-        if cfg.url.trim().is_empty() {
-            return Err("webrequest: settings.url is required".to_string());
-        }
-        let url = net_guard::validate_target_url(&cfg.url)?;
-        // Bound the operator timeout to [1ms, MAX_TIMEOUT_MS] — a gate that could block the request
-        // path past the engine's own hook budget is a foot-gun (and a process-wide permit-starvation
-        // hazard, see MAX_TIMEOUT_MS's doc comment), not a feature.
-        let timeout_ms = cfg
-            .timeout_ms
-            .unwrap_or(DEFAULT_TIMEOUT_MS)
-            .clamp(1, MAX_TIMEOUT_MS);
+        let target = LiveTarget::validate(&cfg)?;
         let client = reqwest::Client::builder()
             // Disable redirects so a target cannot 30x us onto an internal host at runtime (the
             // validated URL only guarantees the FIRST hop is safe).
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_millis(timeout_ms))
+            // Pinned to the OPEN-time timeout, not re-read on a later `configure` (see `configure`'s doc
+            // comment): this only bounds the connect sub-phase, and the per-request `.timeout(...)` in
+            // `post_op` (which DOES read the live, possibly-reconfigured value on every call) always
+            // bounds the whole request at or under it. A connect_timeout that is stale-high is a no-op
+            // (the smaller per-request timeout still cuts the call off on schedule); stale-low only makes
+            // the connect sub-phase fail slightly earlier than a later, larger configured timeout would
+            // strictly require — never a foot-gun in either direction, so rebuilding the client (and
+            // losing its warm connection pool) on every `configure` push is not needed to stay correct.
+            .connect_timeout(target.timeout)
             .build()
             .map_err(|e| format!("webrequest: failed to build HTTP client: {e}"))?;
         // A current-thread runtime is enough: one blocking op at a time per engine spawn_blocking call.
@@ -150,9 +186,8 @@ impl Forwarder {
             .build()
             .map_err(|e| format!("webrequest: failed to build async runtime: {e}"))?;
         Ok(Self {
-            url,
+            live: RwLock::new(target),
             client,
-            timeout: Duration::from_millis(timeout_ms),
             rt: Some(rt),
         })
     }
@@ -171,6 +206,14 @@ impl Forwarder {
     fn post_op(&self, op: &str, payload: &serde_json::Value) -> Result<serde_json::Value, String> {
         let body = serde_json::to_vec(&Envelope { op, payload })
             .map_err(|e| format!("webrequest: failed to serialize op envelope: {e}"))?;
+        // Read the LIVE (possibly `configure`-updated) target ONCE, under a single lock acquisition, so
+        // a settings push that commits mid-call can never tear this request across an old url paired
+        // with a new timeout (or vice versa). Snapshotted outside `block_on`'s async block so the lock
+        // is never held across an await point.
+        let (target_url, target_timeout) = {
+            let live = read_live(&self.live);
+            (live.url.clone(), live.timeout)
+        };
         // Safe: `rt` is `Some` for the whole lifetime between `new` and `Drop` (only `Drop` takes it).
         let rt = self
             .rt
@@ -182,10 +225,10 @@ impl Forwarder {
             // stripped before it is formatted. Parity with the old webhook hardening.
             let resp = self
                 .client
-                .post(self.url.clone())
+                .post(target_url)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body)
-                .timeout(self.timeout)
+                .timeout(target_timeout)
                 .send()
                 .await
                 .map_err(|e| format!("webrequest: request failed: {}", e.without_url()))?;
@@ -199,6 +242,20 @@ impl Forwarder {
             parse_reply(&buf)
         })
     }
+}
+
+/// Read `live`, recovering from a poisoned lock rather than panicking: nothing in either critical
+/// section (a field clone/read, a plain field assignment) can itself panic, so poisoning here would only
+/// ever come from an unrelated bug; propagating it would brick this long-lived singleton's routing for
+/// the rest of the process's life over a panic that had nothing to do with the target it guards.
+fn read_live(live: &RwLock<LiveTarget>) -> std::sync::RwLockReadGuard<'_, LiveTarget> {
+    live.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Write `live`, recovering from a poisoned lock — see [`read_live`].
+fn write_live(live: &RwLock<LiveTarget>) -> std::sync::RwLockWriteGuard<'_, LiveTarget> {
+    live.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Read a response body under the [`MAX_REPLY_BYTES`] cap, ABORTING (rather than allocating) once the
@@ -346,27 +403,33 @@ impl HookHandler for Forwarder {
         let _ = self.post_op("notify", payload);
     }
 
-    /// `configure` — RE-VALIDATE the (possibly changed) `settings.url` against the SSRF guard, then ACK
-    /// the pushed version. Re-validation is the security point: an operator PATCHing the URL to an
-    /// internal target after load must be refused (a NACK → the engine rejects the push). The forwarder
-    /// keeps using its already-validated live URL; committing the new URL is a reload concern.
+    /// `configure` — RE-VALIDATE the (possibly changed) `settings.url`/`settings.timeout_ms` and, if
+    /// valid, COMMIT them as the live target before ACKing. Busbar's own contract for this op is
+    /// "commit on ack" (`docs/admin-api.md`'s `PATCH /hooks/{name}/settings`: only a version-echoing ACK
+    /// commits the push, and nothing there scopes hook settings as restart-to-apply the way `store` is) —
+    /// so an ACK that left the forwarder still POSTing to the OLD target would silently break that
+    /// contract: the operator's PATCH would report success while every request kept routing to whatever
+    /// was configured at `open`, until an unrelated future plugin reload happened to pick the change up.
+    /// Each key is independently optional (an absent key means "leave the live value alone", matching a
+    /// push that only changes one of `url`/`timeout_ms`); a key that IS present but fails validation (a
+    /// wrong type or an SSRF-blocked url) NACKs the WHOLE push and commits neither, so a bad `timeout_ms`
+    /// can never slip a validated `url` through partially-applied, or vice versa.
     fn configure(
         &self,
         settings: &serde_json::Map<String, serde_json::Value>,
         _settings_version: u64,
     ) -> bool {
-        match settings.get("url") {
-            // Missing url → nothing to re-check (ACK).
-            None => true,
+        let new_url = match settings.get("url") {
+            None => None,
             // Present but not a string (e.g. a templating bug renders it as a number or null) is a
             // malformed push, not an absent one — treating the two identically would silently ACK a
             // garbage config with no NACK signal for the operator to notice. NACK it explicitly.
             Some(v) if v.as_str().is_none() => {
                 eprintln!("webrequest: configure() rejected: settings.url is present but not a string ({v})");
-                false
+                return false;
             }
             Some(v) => match net_guard::validate_target_url(v.as_str().expect("checked above")) {
-                Ok(_) => true,
+                Ok(url) => Some(url),
                 Err(reason) => {
                     // The `HookHandler::configure` ABI contract is a bare `bool` ACK/NACK — there is no
                     // return-message channel to thread the specific (already userinfo-masked) rejection
@@ -376,10 +439,35 @@ impl HookHandler for Forwarder {
                     // discoverable rather than silently dropping it, so an operator whose reconfigure
                     // NACKs at least has somewhere to look.
                     eprintln!("webrequest: configure() rejected: {reason}");
-                    false
+                    return false;
                 }
             },
+        };
+        let new_timeout = match settings.get("timeout_ms") {
+            None => None,
+            // Same present-but-wrong-typed NACK rule as `url` above — `as_u64()` also correctly rejects
+            // a negative number, which JSON permits but a millisecond duration cannot represent.
+            Some(v) => match v.as_u64() {
+                Some(ms) => Some(Duration::from_millis(ms.clamp(1, MAX_TIMEOUT_MS))),
+                None => {
+                    eprintln!(
+                        "webrequest: configure() rejected: settings.timeout_ms is present but not a non-negative integer ({v})"
+                    );
+                    return false;
+                }
+            },
+        };
+        if new_url.is_none() && new_timeout.is_none() {
+            return true; // Nothing pushed that changes the live target — ACK, nothing to commit.
         }
+        let mut live = write_live(&self.live);
+        if let Some(url) = new_url {
+            live.url = url;
+        }
+        if let Some(timeout) = new_timeout {
+            live.timeout = timeout;
+        }
+        true
     }
 
     /// `describe` — the forwarder's OWN self-description envelope. It does not proxy `describe` to the
@@ -407,12 +495,13 @@ impl HookHandler for Forwarder {
     /// timeout; it does not proxy `status` to the target, which may not implement it). No prompt/user
     /// content is ever surfaced here.
     fn status(&self) -> serde_json::Value {
+        let live = read_live(&self.live);
         serde_json::json!({
             "status": {
                 "settings": {
                     // Host only (no path/query/userinfo) — enough for an operator to see WHERE it forwards.
-                    "target_host": self.url.host_str().unwrap_or(""),
-                    "timeout_ms": self.timeout.as_millis() as u64
+                    "target_host": live.url.host_str().unwrap_or(""),
+                    "timeout_ms": live.timeout.as_millis() as u64
                 },
                 "metrics": []
             }

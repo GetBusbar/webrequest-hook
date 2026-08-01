@@ -276,7 +276,7 @@ fn timeout_ms_is_clamped_to_max_timeout_ms() {
     })
     .expect("valid config");
     assert_eq!(
-        fwd.timeout,
+        fwd.live.read().unwrap().timeout,
         Duration::from_millis(MAX_TIMEOUT_MS),
         "an oversized timeout_ms must clamp to MAX_TIMEOUT_MS, not pass through"
     );
@@ -287,9 +287,95 @@ fn timeout_ms_is_clamped_to_max_timeout_ms() {
     })
     .expect("valid config");
     assert_eq!(
-        fwd.timeout,
+        fwd.live.read().unwrap().timeout,
         Duration::from_millis(1),
         "a zero timeout_ms must clamp up to the 1ms floor"
+    );
+}
+
+/// RED (pre-fix): `configure` validated a pushed `url` against the SSRF guard and ACKed, but never
+/// actually updated the live forwarder — every subsequent `decide`/`transform`/`notify` kept posting to
+/// the URL from `open`, silently, forever (until an unrelated future plugin reload). That breaks
+/// Busbar's own documented contract for this op (`docs/admin-api.md`'s `PATCH /hooks/{name}/settings`:
+/// "commit on ack", no restart-to-apply carve-out for hooks) — an operator's PATCH would report success
+/// while nothing actually changed.
+/// GREEN: a committed (ACKed) `url` push is visible immediately via `status()`.
+#[test]
+fn configure_commits_a_new_url_to_the_live_target() {
+    let fwd = Forwarder::new(Config {
+        url: "https://api.example.com/route".to_string(),
+        timeout_ms: None,
+    })
+    .expect("valid config");
+    assert_eq!(
+        fwd.status()["status"]["settings"]["target_host"],
+        "api.example.com"
+    );
+
+    let mut push = serde_json::Map::new();
+    push.insert(
+        "url".into(),
+        serde_json::json!("https://other.example.com/route"),
+    );
+    assert!(fwd.configure(&push, 2), "a valid pushed url must ACK");
+
+    assert_eq!(
+        fwd.status()["status"]["settings"]["target_host"],
+        "other.example.com",
+        "an ACKed url push must take effect on the live forwarder, not just validate and discard"
+    );
+}
+
+/// A committed `timeout_ms` push (with no `url` key in the same push) updates the live timeout and
+/// leaves the live url untouched — the two settings commit independently.
+#[test]
+fn configure_commits_a_new_timeout_without_touching_the_url() {
+    let fwd = Forwarder::new(Config {
+        url: "https://api.example.com/route".to_string(),
+        timeout_ms: Some(1234),
+    })
+    .expect("valid config");
+
+    let mut push = serde_json::Map::new();
+    push.insert("timeout_ms".into(), serde_json::json!(500));
+    assert!(
+        fwd.configure(&push, 2),
+        "a valid pushed timeout_ms must ACK"
+    );
+
+    let status = fwd.status();
+    assert_eq!(status["status"]["settings"]["timeout_ms"], 500);
+    assert_eq!(
+        status["status"]["settings"]["target_host"], "api.example.com",
+        "a timeout_ms-only push must not disturb the live url"
+    );
+}
+
+/// A pushed `timeout_ms` that's PRESENT but not a non-negative integer (a string, a float, a negative
+/// number) must NACK the whole push — including any `url` key in the SAME push, which must not commit
+/// partially.
+#[test]
+fn configure_nacks_a_present_but_wrong_typed_timeout_and_does_not_partially_apply() {
+    let fwd = Forwarder::new(Config {
+        url: "https://api.example.com/route".to_string(),
+        timeout_ms: None,
+    })
+    .expect("valid config");
+
+    let mut push = serde_json::Map::new();
+    push.insert(
+        "url".into(),
+        serde_json::json!("https://other.example.com/route"),
+    );
+    push.insert("timeout_ms".into(), serde_json::json!("soon"));
+    assert!(
+        !fwd.configure(&push, 2),
+        "a non-integer timeout_ms must NACK"
+    );
+    assert_eq!(
+        fwd.status()["status"]["settings"]["target_host"],
+        "api.example.com",
+        "a NACKed push must not partially commit the url from the same push"
     );
 }
 
