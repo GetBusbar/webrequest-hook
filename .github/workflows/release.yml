@@ -28,19 +28,6 @@ permissions:
   id-token: write      # OIDC identity for keyless Sigstore signing (provenance)
   attestations: write  # record the build-provenance attestation
 
-env:
-  # Which busbar commit to check out as the sibling path dependency. Pinned to a SHA on the
-  # dev branch (NOT the mutable branch name) because this step also builds and runs
-  # busbar-plugin-pack in the same job that holds BUSBAR_SIGN_KEY (with id-token: write) — a
-  # mutable branch ref there would let anyone who can push to dev reach this repo's signing
-  # key. Resolved 2026-07-31 via `gh api repos/GetBusbar/busbar/branches/dev`, which was also
-  # the tip at the time: ad0c60c30ba48511faf9463e6d988d6e49985c7b. Only crates/plugin-sdk,
-  # crates/plugin-loader, crates/api, and crates/plugin-pack are needed from this checkout — all
-  # present at this SHA. To bump deliberately: verify the new SHA still has crates/plugin-sdk,
-  # crates/plugin-loader, crates/api, and crates/plugin-pack, then update the SHA below and this
-  # comment (see busbar-auth-oidc's release.yml for the same convention this mirrors).
-  BUSBAR_REF: 5b78db9fe0059a08907978f15bcde67e8cd757f9 # v1.5.0 release SHA (GetBusbar/busbar main, 2026-08-02)
-
 jobs:
   # Create the Release first so the parallel per-target upload jobs have something to attach to
   # (uploading from a matrix without a pre-existing release races -> "release not found").
@@ -98,11 +85,16 @@ jobs:
         with:
           path: webrequest-hook
 
+      - name: Resolve busbar ref from .busbar-ref
+        id: ref
+        run: echo "sha=$(cut -d' ' -f1 webrequest-hook/.busbar-ref)" >> "$GITHUB_OUTPUT"
+        shell: bash
+
       - name: Checkout busbar (sibling path dependency)
         uses: actions/checkout@v7
         with:
           repository: GetBusbar/busbar
-          ref: ${{ env.BUSBAR_REF }}
+          ref: ${{ steps.ref.outputs.sha }}
           path: busbarAI
 
       - uses: dtolnay/rust-toolchain@stable
