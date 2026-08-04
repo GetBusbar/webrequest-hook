@@ -28,19 +28,6 @@ permissions:
   id-token: write      # OIDC identity for keyless Sigstore signing (provenance)
   attestations: write  # record the build-provenance attestation
 
-env:
-  # Which busbar commit to check out as the sibling path dependency. Pinned to a SHA on the
-  # dev branch (NOT the mutable branch name) because this step also builds and runs
-  # busbar-plugin-pack in the same job that holds BUSBAR_SIGN_KEY (with id-token: write) — a
-  # mutable branch ref there would let anyone who can push to dev reach this repo's signing
-  # key. Resolved 2026-07-31 via `gh api repos/GetBusbar/busbar/branches/dev`, which was also
-  # the tip at the time: ad0c60c30ba48511faf9463e6d988d6e49985c7b. Only crates/plugin-sdk,
-  # crates/plugin-loader, crates/api, and crates/plugin-pack are needed from this checkout — all
-  # present at this SHA. To bump deliberately: verify the new SHA still has crates/plugin-sdk,
-  # crates/plugin-loader, crates/api, and crates/plugin-pack, then update the SHA below and this
-  # comment (see busbar-auth-oidc's release.yml for the same convention this mirrors).
-  BUSBAR_REF: ad0c60c30ba48511faf9463e6d988d6e49985c7b
-
 jobs:
   # Create the Release first so the parallel per-target upload jobs have something to attach to
   # (uploading from a matrix without a pre-existing release races -> "release not found").
@@ -98,11 +85,16 @@ jobs:
         with:
           path: webrequest-hook
 
+      - name: Resolve busbar ref from .busbar-ref
+        id: ref
+        run: echo "sha=$(cut -d' ' -f1 webrequest-hook/.busbar-ref)" >> "$GITHUB_OUTPUT"
+        shell: bash
+
       - name: Checkout busbar (sibling path dependency)
         uses: actions/checkout@v7
         with:
           repository: GetBusbar/busbar
-          ref: ${{ env.BUSBAR_REF }}
+          ref: ${{ steps.ref.outputs.sha }}
           path: busbarAI
 
       - uses: dtolnay/rust-toolchain@stable
@@ -160,3 +152,59 @@ jobs:
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: "plugin-dist/*.tar.gz"
+
+  # PHANTOM-RELEASE GUARD: assert the published Release actually carries assets before we treat this
+  # as a real release. The per-target build/upload jobs run with fail-fast:false, and `create-release`
+  # always makes the (initially empty) Release up front — so a build/pack failure on EVERY target
+  # (e.g. a stale Cargo.lock tripping `--locked`, as happened on the first v1.0.3 cut) leaves a tag +
+  # Release with ZERO assets: a "phantom" that silently breaks busbar's plugin-registry-gate. This job
+  # fails the whole release run loud if assets == 0, so a phantom can never ship (or notify marketing)
+  # unnoticed again. It depends on the build matrix but does NOT inherit its fail-fast:false — one
+  # green target is enough to have assets, but zero across the board must hard-fail here.
+  verify-assets:
+    needs: [webrequest-plugin]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assert the Release has at least one asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          count="$(gh release view "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json assets --jq '.assets | length')"
+          echo "Release ${GITHUB_REF_NAME} has ${count} asset(s)."
+          if [ "${count}" -eq 0 ]; then
+            echo "::error::PHANTOM RELEASE: ${GITHUB_REF_NAME} was published with 0 assets." \
+                 "Every build/pack target failed to upload a tarball. Failing the release run so this" \
+                 "tag is not mistaken for a real release by busbar's plugin-registry-gate. Fix the" \
+                 "build (check Cargo.lock freshness vs --locked and the plugin cdylib build step)," \
+                 "delete this tag+release, and re-cut." >&2
+            exit 1
+          fi
+
+  # Instant marketing-site rebuild the moment this plugin ships a real release -- marketing's
+  # deploy.yml listens for this exact repository_dispatch event type (plus its own daily-poll
+  # fallback, so a missed/failed dispatch here is never a permanent gap). Same RELEASE_DISPATCH_TOKEN
+  # pattern busbar core's own release.yml uses for its downstream fan-out -- see that file's
+  # notify-downstream job for the template this mirrors. Fails loud (not a silent no-op) if the
+  # secret isn't provisioned, so a missing secret can't masquerade as "nothing to notify."
+  notify-marketing:
+    needs: [webrequest-plugin, verify-assets]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch upstream-release to the marketing site
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::RELEASE_DISPATCH_TOKEN is not provisioned on this repo -- cannot notify" \
+                 "marketing instantly. marketing's own daily poll will still pick this release up" \
+                 "within 24h (self-healing fallback intact)." >&2
+            exit 1
+          fi
+          gh api "repos/GetBusbar/marketing/dispatches" \
+            -f event_type=upstream-release \
+            -f "client_payload[repo]=${GITHUB_REPOSITORY}" \
+            -f "client_payload[tag]=${GITHUB_REF_NAME}"

@@ -46,6 +46,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Fixed ed25519 signing secret (64 hex = 32 bytes) for this e2e test. 1.5.1 requires an
+/// explicit signing key to mint virtual keys; busbar no longer auto-generates one.
+const TEST_SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 /// The sibling `busbarAI` monorepo checkout — same interim path convention as `Cargo.toml`'s
 /// `busbar-plugin-sdk` dependency.
 fn busbarai_root() -> PathBuf {
@@ -329,6 +333,7 @@ listen: "127.0.0.1:{data_port}"
 admin_listen: "127.0.0.1:{admin_port}"
 auth:
   chain: []
+  signing_key: {{ env: BUSBAR_SIGNING_KEY }}
   admin_auth:
     - admin-tokens: {{ token: {{ env: BUSBAR_E2E_ADMIN_TOKEN }} }}
 plugins:
@@ -356,6 +361,7 @@ models:
         .env("BUSBAR_PROVIDERS", workdir.join("providers.yaml"))
         .env("BUSBAR_E2E_ADMIN_TOKEN", &admin_token)
         .env("BUSBAR_E2E_UPSTREAM_KEY", "sk-e2e-fake-upstream-key")
+        .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn busbar");
