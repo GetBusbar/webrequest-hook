@@ -331,11 +331,12 @@ mockup:
         r#"
 listen: "127.0.0.1:{data_port}"
 admin_listen: "127.0.0.1:{admin_port}"
+identity-providers:
+  admin-tokens: {{ module: admin-tokens, token: {{ env: BUSBAR_E2E_ADMIN_TOKEN }} }}
 auth:
   chain: []
   signing_key: {{ env: BUSBAR_SIGNING_KEY }}
-  admin_auth:
-    - admin-tokens: {{ token: {{ env: BUSBAR_E2E_ADMIN_TOKEN }} }}
+  admin_auth: [admin-tokens]
 plugins:
   enabled: true
   dir: "{plugins_dir}"
