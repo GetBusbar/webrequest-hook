@@ -29,9 +29,12 @@
 //!      `tests/e2e.rs`'s `mock_target`/`capturing_target`).
 //!   6. `POST /{model}/v1/messages` — a real Anthropic-shaped chat request through the real router,
 //!      against a real (mocked) upstream model.
-//!   7. Confirm the mock webhook server received a REAL POST with the REAL engine-built envelope
+//!   7. Confirm the mock webhook server received REAL POSTs with the REAL engine-built envelopes
 //!      (`{"op":"notify", "request": {...}}`) carrying the real prompt text — the full round trip:
-//!      real admin install -> real plugin load -> real hook invocation -> real webhook call.
+//!      real admin install -> real plugin load -> real hook invocation -> real webhook call. Since
+//!      1.5.3 a tap that names no `phase:` fires at all FOUR core stages (request, candidate,
+//!      routing, response), so ONE request produces FOUR calls sharing one `request.request_id`;
+//!      the prompt text rides the REQUEST-stage payload.
 //!
 //! Requires the sibling `../busbarAI` checkout (same interim path-dependency convention as
 //! `Cargo.toml`). The `busbar` binary is built on demand (cached under its own `target/`) the first
@@ -516,34 +519,71 @@ models:
     );
 
     // ── 8. Confirm the mock webhook ACTUALLY received the real HTTP round trip ──────────────────
+    // A `phase:`-less tap fires at ALL FOUR core stages (1.5.3: request, candidate, routing,
+    // response — busbar's `CORE_HOOK_PHASES`, frozen so a later stage is strictly additive), so ONE
+    // real request produces FOUR real webhook calls, not one. `response` is the last of them, so
+    // waiting for it is what makes this poll deterministic rather than a race on whichever stage
+    // happened to land first.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let received = loop {
         let snapshot = captured.lock().unwrap().clone();
-        if !snapshot.is_empty() {
+        if snapshot.iter().any(|e| e["stage"]["at"] == "response") {
             break snapshot;
         }
         if std::time::Instant::now() > deadline {
             panic!(
-                "the mock webhook target never received a call from the real, admin-API-installed \
-                 webrequest hook within 10s — the real install -> load -> invoke -> webhook chain \
-                 did not complete"
+                "the mock webhook target never received the full four-stage tap sequence from the \
+                 real, admin-API-installed webrequest hook within 10s — the real install -> load \
+                 -> invoke -> webhook chain did not complete. Got: {snapshot:?}"
             );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
 
+    // Every stage is a `notify` (a tap is never answered), whatever the stage.
+    for envelope in &received {
+        assert_eq!(
+            envelope["op"], "notify",
+            "the REAL engine wire envelope must carry the op discriminator: {envelope}"
+        );
+    }
+
+    // All four core stages, exactly once each. The REQUEST stage is the one with NO `stage` key
+    // (the pre-1.5.3 wire, kept byte-identical); the other three name themselves.
+    let mut stages: Vec<&str> = received
+        .iter()
+        .map(|e| e["stage"]["at"].as_str().unwrap_or("request"))
+        .collect();
+    stages.sort_unstable();
     assert_eq!(
-        received.len(),
+        stages,
+        vec!["candidate", "request", "response", "routing"],
+        "one real request must produce exactly the four core-stage taps: {received:?}"
+    );
+
+    // The 1.5.3 JOIN KEY: every stage of the same request carries the SAME `request.request_id`,
+    // which is what lets a tap stitch a routing decision to its eventual outcome.
+    let request_ids: std::collections::HashSet<u64> = received
+        .iter()
+        .map(|e| {
+            e["request"]["request_id"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("every tap payload must carry request_id: {e}"))
+        })
+        .collect();
+    assert_eq!(
+        request_ids.len(),
         1,
-        "exactly one real webhook call expected for one real request: {received:?}"
+        "all four stage taps for ONE request must share ONE request_id: {received:?}"
     );
-    let envelope = &received[0];
-    assert_eq!(
-        envelope["op"], "notify",
-        "the REAL engine wire envelope must carry the op discriminator: {envelope}"
-    );
+
     // The real engine's own hook wire projection — not a hand-rolled test stub — actually carried
-    // the real prompt text through to the real webhook target.
+    // the real prompt text through to the real webhook target. Only the REQUEST-stage payload
+    // carries the granted prompt; the stage taps project shape + stage, not content.
+    let envelope = received
+        .iter()
+        .find(|e| e["stage"].is_null())
+        .unwrap_or_else(|| panic!("no request-stage tap in {received:?}"));
     let envelope_text = envelope.to_string();
     assert!(
         envelope_text.contains(prompt_text),

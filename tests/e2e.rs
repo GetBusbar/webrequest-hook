@@ -267,6 +267,10 @@ fn cfg(url: &str) -> String {
 
 fn req_with_prompt(text: &str) -> RoutingRequest<'static> {
     RoutingRequest {
+        // A real non-zero correlation id (core stamps a per-request `u64` at ingress; `0` is what an
+        // unstamped projection looks like). These test projectors don't put it on the wire, so
+        // nothing asserts on it yet — but the fixture should look like a real request.
+        request_id: 1001,
         pool: "p",
         ingress_protocol: "anthropic",
         requested_model: None,
@@ -282,6 +286,10 @@ fn req_with_prompt(text: &str) -> RoutingRequest<'static> {
             messages: vec![("user".into(), text.to_string().into())],
         }),
         identity: None,
+        // The DEFAULT (empty) declared-signal bag. The forwarder declares no signals, so this is
+        // exactly what the engine hands it on every real request — the default path these tests
+        // exercise — not a placeholder for missing coverage.
+        signals: Default::default(),
     }
 }
 
@@ -299,6 +307,8 @@ fn cand(idx: usize) -> Candidate<'static> {
         available_concurrency: 1,
         budget_remaining: None,
         rate_headroom: None,
+        // Candidate-phase declared signals: empty, same reason as the request bag above.
+        signals: Default::default(),
     }
 }
 
