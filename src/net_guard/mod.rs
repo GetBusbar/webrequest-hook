@@ -51,6 +51,51 @@ pub(crate) fn is_link_local_v6(addr: &Ipv6Addr) -> bool {
     (addr.segments()[0] & 0xffc0) == 0xfe80
 }
 
+/// IPv6 site-local `fec0::/10`. Deprecated by RFC 3879 but still routed on plenty of real networks,
+/// and NOT covered by the ULA or link-local masks (`0xfec0 & 0xfe00` is `0xfe00`, not `0xfc00`;
+/// `0xfec0 & 0xffc0` is `0xfec0`, not `0xfe80`), so without this it was simply allowed.
+pub(crate) fn is_site_local_v6(addr: &Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xffc0) == 0xfec0
+}
+
+/// The IPv4 address embedded in an IPv6 TRANSLATION or TUNNELLING address, if there is one.
+///
+/// `Ipv6Addr::to_ipv4` only unwraps the `::a.b.c.d` and `::ffff:a.b.c.d` forms, which leaves two
+/// widely-deployed embeddings that carry the same internal IPv4 targets straight past the guard:
+///
+/// - **NAT64, `64:ff9b::/96`** (RFC 6052). Standard on IPv6-only clusters with a NAT64 gateway, so
+///   `[64:ff9b::a9fe:a9fe]` is a live route to `169.254.169.254`.
+/// - **6to4, `2002::/16`** (RFC 3056), which carries the IPv4 address in the next 32 bits, so
+///   `[2002:a00:1::]` is `10.0.0.1`.
+///
+/// Returning the embedded address lets the caller run it through the same `is_internal_v4` policy
+/// as any other IPv4 target, rather than maintaining a second, divergent list.
+pub(crate) fn embedded_v4(addr: &Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = addr.to_ipv4() {
+        return Some(v4);
+    }
+    let s = addr.segments();
+    // NAT64 well-known prefix: the IPv4 address is the last 32 bits.
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
+        return Some(Ipv4Addr::new(
+            (s[6] >> 8) as u8,
+            (s[6] & 0xff) as u8,
+            (s[7] >> 8) as u8,
+            (s[7] & 0xff) as u8,
+        ));
+    }
+    // 6to4: 2002:AABB:CCDD::/48 encodes A.B.C.D.
+    if s[0] == 0x2002 {
+        return Some(Ipv4Addr::new(
+            (s[1] >> 8) as u8,
+            (s[1] & 0xff) as u8,
+            (s[2] >> 8) as u8,
+            (s[2] & 0xff) as u8,
+        ));
+    }
+    None
+}
+
 /// RFC 6598 Shared Address Space `100.64.0.0/10` (CGNAT) — routable inside AWS/GCP VPCs and k8s
 /// clusters, so an SSRF target the private/link-local checks miss. `Ipv4Addr::is_private()` misses it.
 pub(crate) fn is_cgnat_shared_v4(v4: &Ipv4Addr) -> bool {
@@ -174,8 +219,15 @@ pub(crate) fn host_is_loopback(url: &reqwest::Url) -> bool {
 /// SSRF block predicate for the target URL: identical to a full internal check EXCEPT loopback and the
 /// `localhost` DNS name are NOT blocked (the loopback-sidecar carve-out the old webhook policy kept).
 /// Every other internal/metadata target is blocked: cloud-metadata names + IMDS literal, RFC1918
-/// private, RFC6598 CGNAT, link-local, IPv6 ULA/link-local/unspecified, and the alternate-IPv4
-/// encodings that resolve to those. Mirrors `observability::otlp_host_is_blocked`.
+/// private, RFC6598 CGNAT, link-local, IPv6 ULA/link-local/site-local/unspecified, the IPv4
+/// addresses embedded in IPv4-mapped, IPv4-compatible, NAT64 and 6to4 IPv6 forms, and the
+/// alternate-IPv4 encodings that resolve to those.
+///
+/// WHAT THIS DOES NOT DO, stated plainly because the difference matters: it inspects the URL's
+/// literal host text and never resolves a name. A DNS hostname that resolves to an internal address
+/// is NOT blocked. So this closes the IP-literal spellings of an internal target, which is the
+/// misconfiguration and copy-paste case, and it does not close a name deliberately pointed at one.
+/// Closing that needs resolve-then-pin at connect time; see the repo's latent-hazards note.
 pub(crate) fn host_is_blocked(url: &reqwest::Url) -> bool {
     let Some(host) = host_of(url) else {
         return true; // a URL with no host is unusable as a target
@@ -192,10 +244,13 @@ pub(crate) fn host_is_blocked(url: &reqwest::Url) -> bool {
             if v6.is_loopback() {
                 return false; // `::1` loopback sidecar — allowed
             }
-            if let Some(v4) = v6.to_ipv4() {
+            if let Some(v4) = embedded_v4(&v6) {
                 return !v4.is_loopback() && is_internal_v4(&v4);
             }
-            v6.is_unspecified() || is_unique_local_v6(&v6) || is_link_local_v6(&v6)
+            v6.is_unspecified()
+                || is_unique_local_v6(&v6)
+                || is_link_local_v6(&v6)
+                || is_site_local_v6(&v6)
         }
         // DNS name: metadata names blocked above; `localhost` and any external host allowed.
         Err(_) => false,
