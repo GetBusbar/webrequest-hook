@@ -37,7 +37,7 @@
 //! to an allowed IP at validation and to a blocked internal IP later (DNS rebinding / TOCTOU) is not
 //! defended against here.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
 // ── Pure context-free predicates (copied verbatim from busbar/src/net_guard.rs) ────────────────────
 
@@ -235,11 +235,10 @@ pub(crate) fn host_is_loopback(url: &reqwest::Url) -> bool {
 /// addresses embedded in IPv4-mapped, IPv4-compatible, NAT64 and 6to4 IPv6 forms, and the
 /// alternate-IPv4 encodings that resolve to those.
 ///
-/// WHAT THIS DOES NOT DO, stated plainly because the difference matters: it inspects the URL's
-/// literal host text and never resolves a name. A DNS hostname that resolves to an internal address
-/// is NOT blocked. So this closes the IP-literal spellings of an internal target, which is the
-/// misconfiguration and copy-paste case, and it does not close a name deliberately pointed at one.
-/// Closing that needs resolve-then-pin at connect time; see the repo's latent-hazards note.
+/// This inspects the URL's literal host TEXT only and never resolves a name — that is
+/// [`resolve_and_check`]'s job, and the two are used together by [`checked_addrs_for`]. Keeping the
+/// textual check separate matters: it is total (no I/O, no failure mode), so it can run first and
+/// reject the IP-literal spellings before anything touches the network.
 pub(crate) fn host_is_blocked(url: &reqwest::Url) -> bool {
     let Some(host) = host_of(url) else {
         return true; // a URL with no host is unusable as a target
@@ -267,6 +266,81 @@ pub(crate) fn host_is_blocked(url: &reqwest::Url) -> bool {
         // DNS name: metadata names blocked above; `localhost` and any external host allowed.
         Err(_) => false,
     }
+}
+
+/// Resolve `host:port` and reject the result if ANY address is internal.
+///
+/// This is the half [`host_is_blocked`] cannot do. That one reads the URL's literal host text, so it
+/// stops `https://169.254.169.254/` and every alternate spelling of it — the misconfiguration and
+/// copy-paste case — but a NAME pointed at an internal address sails straight through, because a
+/// name is not an address until something resolves it.
+///
+/// ANY, not all: a name that resolves to one external and one internal address is rejected outright.
+/// Connecting would be a coin flip between them, and "sometimes reaches the metadata service" is not
+/// a weaker problem than "always does".
+///
+/// A resolution FAILURE is deliberately NOT an error here (`Ok(None)`). A target whose DNS is
+/// briefly down is an availability event, not a security one — it cannot reach anything, internal or
+/// otherwise, and failing the plugin's load over it would take the whole gateway down for a
+/// transient blip. The caller treats `None` as "allowed, but nothing to pin".
+fn resolve_and_check(host: &str, port: u16) -> Result<Option<Vec<SocketAddr>>, String> {
+    let Ok(addrs) = (host, port).to_socket_addrs() else {
+        return Ok(None);
+    };
+    let addrs: Vec<SocketAddr> = addrs.collect();
+    if addrs.is_empty() {
+        return Ok(None);
+    }
+    for addr in &addrs {
+        if ip_is_internal(&addr.ip()) {
+            return Err(format!(
+                "resolves to the internal address {} (SSRF guard; loopback sidecars are allowed)",
+                addr.ip()
+            ));
+        }
+    }
+    Ok(Some(addrs))
+}
+
+/// The internal-address predicate, over an already-resolved [`IpAddr`]. Shares its rules with
+/// [`host_is_blocked`]'s literal-text path so a name and a literal cannot disagree about the same
+/// address — the loopback carve-out for sidecars included.
+fn ip_is_internal(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_loopback() && is_internal_v4(v4),
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return false;
+            }
+            if let Some(v4) = embedded_v4(v6) {
+                return !v4.is_loopback() && is_internal_v4(&v4);
+            }
+            v6.is_unspecified()
+                || is_unique_local_v6(v6)
+                || is_link_local_v6(v6)
+                || is_site_local_v6(v6)
+        }
+    }
+}
+
+/// The addresses a validated `url` may be connected to, for pinning — `None` when the host is an IP
+/// literal (already checked, nothing to pin) or did not resolve.
+///
+/// Pinning is what makes the resolve check MEAN anything. Without it the guard resolves a name,
+/// approves the addresses, and then hands the bare hostname to the HTTP client, which resolves it
+/// AGAIN at connect time and may get a different answer — the DNS-rebinding shape, where the second
+/// answer is the metadata service. Feeding these exact addresses to the client closes that: the
+/// approved addresses are the only ones it will ever dial.
+pub(crate) fn checked_addrs_for(url: &reqwest::Url) -> Result<Option<Vec<SocketAddr>>, String> {
+    let Some(host) = host_of(url) else {
+        return Ok(None);
+    };
+    if host.parse::<IpAddr>().is_ok() || is_alternate_ipv4_encoding(&host) {
+        return Ok(None); // an IP literal: `host_is_blocked` already ruled on it
+    }
+    let port = url.port_or_known_default().unwrap_or(443);
+    resolve_and_check(&host, port)
+        .map_err(|why| format!("webrequest: settings.url host '{host}' {why}"))
 }
 
 /// The URL's host with the IPv6 `[...]` brackets and a single trailing FQDN-root `.` stripped, so the

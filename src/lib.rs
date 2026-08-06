@@ -123,7 +123,11 @@ struct Forwarder {
     // long-lived singleton plugin instance must not brick itself for its remaining lifetime over a
     // panic in an unrelated call.
     live: RwLock<LiveTarget>,
-    client: reqwest::Client,
+    /// Behind a lock because a `configure` push that changes the HOST has to rebuild it: the client
+    /// carries the pinned DNS answers for the old host (see `build_client`), and a pin for the wrong
+    /// host is worse than no pin. Read-cloned per request; `reqwest::Client` is Arc-backed, so that
+    /// is a refcount bump, not a new pool.
+    client: RwLock<reqwest::Client>,
     // Wrapped in `Option` SOLELY so `Drop` can move the runtime out and shut it down NON-blockingly.
     // A bare `tokio::runtime::Runtime` dropped in place runs its blocking `Drop`, which PANICS when
     // the drop happens on a tokio worker thread ("Cannot drop a runtime in a context where blocking
@@ -159,26 +163,49 @@ impl Drop for Forwarder {
     }
 }
 
+/// Build the forwarding client, PINNED to `addrs` when the target host is a name that resolved.
+///
+/// The pin is what makes the SSRF guard's resolve step mean anything. Without it the guard resolves
+/// the name, approves the addresses, and then hands the bare hostname to reqwest, which resolves it
+/// AGAIN at connect time and can get a different answer — that is DNS rebinding, and the second
+/// answer is the interesting one to an attacker. `resolve_to_addrs` makes the approved addresses the
+/// only ones this client will ever dial for that host.
+///
+/// `None` means there is nothing to pin: an IP literal (already ruled on textually) or a name that
+/// did not resolve. See `net_guard::resolve_and_check` for why a resolution failure is allowed
+/// through rather than treated as a security event.
+fn build_client(
+    target: &LiveTarget,
+    addrs: Option<&[std::net::SocketAddr]>,
+) -> Result<reqwest::Client, String> {
+    let mut b = reqwest::Client::builder()
+        // Disable redirects so a target cannot 30x us onto an internal host at runtime (the
+        // validated URL only guarantees the FIRST hop is safe).
+        .redirect(reqwest::redirect::Policy::none())
+        // Pinned to the timeout in effect when this client was built, not re-read per request: it
+        // only bounds the connect sub-phase, and the per-request `.timeout(...)` in `post_op` (which
+        // DOES read the live, possibly-reconfigured value on every call) always bounds the whole
+        // request at or under it. A connect_timeout that is stale-high is a no-op (the smaller
+        // per-request timeout still cuts the call off on schedule); stale-low only makes the connect
+        // sub-phase fail slightly earlier than a later, larger configured timeout would strictly
+        // require — never a foot-gun in either direction, so a timeout-only `configure` push does not
+        // need to rebuild the client and lose its warm connection pool. A HOST change does, but for
+        // the pin, not the timeout.
+        .connect_timeout(target.timeout);
+    if let (Some(addrs), Some(host)) = (addrs, target.url.host_str()) {
+        b = b.resolve_to_addrs(host, addrs);
+    }
+    b.build()
+        .map_err(|e| format!("webrequest: failed to build HTTP client: {e}"))
+}
+
 impl Forwarder {
     /// Build a forwarder from validated config. Fails closed if the URL is missing, malformed, blocked
     /// by the SSRF guard, or the client/runtime cannot be built.
     fn new(cfg: Config) -> Result<Self, String> {
         let target = LiveTarget::validate(&cfg)?;
-        let client = reqwest::Client::builder()
-            // Disable redirects so a target cannot 30x us onto an internal host at runtime (the
-            // validated URL only guarantees the FIRST hop is safe).
-            .redirect(reqwest::redirect::Policy::none())
-            // Pinned to the OPEN-time timeout, not re-read on a later `configure` (see `configure`'s doc
-            // comment): this only bounds the connect sub-phase, and the per-request `.timeout(...)` in
-            // `post_op` (which DOES read the live, possibly-reconfigured value on every call) always
-            // bounds the whole request at or under it. A connect_timeout that is stale-high is a no-op
-            // (the smaller per-request timeout still cuts the call off on schedule); stale-low only makes
-            // the connect sub-phase fail slightly earlier than a later, larger configured timeout would
-            // strictly require — never a foot-gun in either direction, so rebuilding the client (and
-            // losing its warm connection pool) on every `configure` push is not needed to stay correct.
-            .connect_timeout(target.timeout)
-            .build()
-            .map_err(|e| format!("webrequest: failed to build HTTP client: {e}"))?;
+        let addrs = net_guard::checked_addrs_for(&target.url)?;
+        let client = build_client(&target, addrs.as_deref())?;
         // A current-thread runtime is enough: one blocking op at a time per engine spawn_blocking call.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -186,7 +213,7 @@ impl Forwarder {
             .map_err(|e| format!("webrequest: failed to build async runtime: {e}"))?;
         Ok(Self {
             live: RwLock::new(target),
-            client,
+            client: RwLock::new(client),
             rt: Some(rt),
         })
     }
@@ -213,6 +240,13 @@ impl Forwarder {
             let live = read_live(&self.live);
             (live.url.clone(), live.timeout)
         };
+        // Cloned out from under the lock, so the lock is never held across the await below. Cheap:
+        // `reqwest::Client` is Arc-backed, so this shares the pool rather than building one.
+        let client = self
+            .client
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         // Safe: `rt` is `Some` for the whole lifetime between `new` and `Drop` (only `Drop` takes it).
         let rt = self
             .rt
@@ -230,8 +264,7 @@ impl Forwarder {
             // removing a `?token=...` — the sidecar auth shape `status()` masks for the same reason —
             // and `forward_transport_error_never_leaks_userinfo` asserts exactly that, on the surfaced
             // string, with a `?token=` in the URL so deleting this call fails it.
-            let resp = self
-                .client
+            let resp = client
                 .post(target_url)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body)
@@ -493,12 +526,48 @@ impl HookHandler for Forwarder {
         if new_url.is_none() && new_timeout.is_none() {
             return true; // Nothing pushed that changes the live target — ACK, nothing to commit.
         }
+        // A pushed URL is re-run through the RESOLVE half of the guard too, not just the textual one
+        // above, and the client is rebuilt so the new host's approved addresses are pinned. Doing the
+        // textual check alone here would leave `configure` as the way around the resolve check: push
+        // a name that resolves internally and the forwarder is re-pointed at the metadata service
+        // with the old host's pin still attached, which is worse than no pin at all.
+        //
+        // Built BEFORE the live target is committed, so a rejection leaves the previous target and
+        // its client fully intact — commit-on-ack, matching the rest of this method.
+        let rebuilt = match &new_url {
+            None => None,
+            Some(url) => {
+                let addrs = match net_guard::checked_addrs_for(url) {
+                    Ok(a) => a,
+                    Err(reason) => {
+                        eprintln!("webrequest: configure() rejected: {reason}");
+                        return false;
+                    }
+                };
+                let timeout = new_timeout.unwrap_or_else(|| read_live(&self.live).timeout);
+                let probe = LiveTarget {
+                    url: url.clone(),
+                    timeout,
+                };
+                match build_client(&probe, addrs.as_deref()) {
+                    Ok(c) => Some(c),
+                    Err(reason) => {
+                        eprintln!("webrequest: configure() rejected: {reason}");
+                        return false;
+                    }
+                }
+            }
+        };
+
         let mut live = write_live(&self.live);
         if let Some(url) = new_url {
             live.url = url;
         }
         if let Some(timeout) = new_timeout {
             live.timeout = timeout;
+        }
+        if let Some(client) = rebuilt {
+            *self.client.write().unwrap_or_else(|e| e.into_inner()) = client;
         }
         true
     }

@@ -243,3 +243,92 @@ fn mask_userinfo_survives_tab_in_scheme_separator() {
     );
     assert_eq!(mask_userinfo(&parsed), "https://***@10.0.0.1/route");
 }
+
+// ── resolve-and-pin ───────────────────────────────────────────────────────────────────────────────
+
+/// The textual guard cannot see through a NAME, which is exactly the hole `resolve_and_check` fills.
+/// `localhost` is the one name guaranteed to resolve the same way everywhere, and it resolves to
+/// loopback — which is ALLOWED (sidecars), so this pins the carve-out rather than the block.
+#[test]
+fn a_name_resolving_to_loopback_is_allowed_and_pinned() {
+    let url = reqwest::Url::parse("http://localhost:9/route").unwrap();
+    assert!(
+        !host_is_blocked(&url),
+        "the textual guard allows localhost (sidecar carve-out)"
+    );
+    let addrs = checked_addrs_for(&url).expect("localhost must not be rejected");
+    let addrs = addrs.expect("localhost resolves, so there are addresses to pin");
+    assert!(!addrs.is_empty());
+    assert!(
+        addrs.iter().all(|a| a.ip().is_loopback()),
+        "localhost must resolve to loopback only: {addrs:?}"
+    );
+}
+
+/// An IP LITERAL has nothing to pin: `host_is_blocked` already ruled on it textually, and resolving
+/// it would be a pointless round trip that could only agree with itself.
+#[test]
+fn an_ip_literal_has_nothing_to_pin() {
+    for raw in [
+        "https://93.184.216.34/route",
+        "https://[2606:2800:220:1:248:1893:25c8:1946]/route",
+    ] {
+        let url = reqwest::Url::parse(raw).unwrap();
+        assert!(
+            checked_addrs_for(&url).unwrap().is_none(),
+            "an IP literal must not be resolved: {raw}"
+        );
+    }
+}
+
+/// The resolved-address predicate must agree with the literal-text one about the SAME address --
+/// otherwise a name and a literal spelling of one address could get different answers, which is the
+/// exact inconsistency that makes a guard bypassable.
+#[test]
+fn the_resolved_predicate_agrees_with_the_literal_one() {
+    let cases: [(&str, bool); 10] = [
+        ("127.0.0.1", false),      // loopback sidecar: allowed
+        ("::1", false),            // ditto, v6
+        ("10.0.0.1", true),        // RFC 1918
+        ("172.16.0.1", true),      // RFC 1918
+        ("192.168.1.1", true),     // RFC 1918
+        ("169.254.169.254", true), // link-local / cloud metadata
+        ("100.64.0.1", true),      // CGNAT
+        ("fd00::1", true),         // unique-local v6
+        ("fe80::1", true),         // link-local v6
+        ("93.184.216.34", false),  // ordinary public address
+    ];
+    for (raw, want_internal) in cases {
+        let ip: std::net::IpAddr = raw.parse().unwrap();
+        assert_eq!(
+            ip_is_internal(&ip),
+            want_internal,
+            "resolved-address verdict for {raw}"
+        );
+        // And the literal-text path must say the same thing about the same address.
+        let url = reqwest::Url::parse(&if ip.is_ipv6() {
+            format!("https://[{raw}]/x")
+        } else {
+            format!("https://{raw}/x")
+        })
+        .unwrap();
+        assert_eq!(
+            host_is_blocked(&url),
+            want_internal,
+            "literal-text verdict for {raw} must match the resolved one"
+        );
+    }
+}
+
+/// A name that does not resolve is ALLOWED through with nothing to pin. A DNS outage is an
+/// availability event, not a security one: the target is unreachable either way, and failing the
+/// plugin's load over it would take the gateway down for a transient blip.
+#[test]
+fn a_name_that_does_not_resolve_is_allowed_but_unpinned() {
+    let url = reqwest::Url::parse("https://this-name-must-not-resolve.invalid/route").unwrap();
+    assert_eq!(
+        checked_addrs_for(&url).expect("a resolution failure is not a rejection"),
+        None,
+        "nothing resolved, so there is nothing to pin"
+    );
+}
