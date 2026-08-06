@@ -68,10 +68,16 @@ fn host_is_blocked_covers_the_classic_bypass_forms() {
     // ...and the mapped form of loopback stays ALLOWED, matching the bare-v4 sidecar carve-out.
     assert!(!host_is_blocked(&url("http://[::ffff:127.0.0.1]:8080/x")));
 
-    // ALTERNATE IPv4 ENCODINGS at the entry point. Previously asserted only against the two helper
-    // predicates, never against a URL, so the branch that consults them was untested.
-    assert!(host_is_blocked(&url("http://2851995666/latest"))); // 169.254.169.254 decimal
-    assert!(host_is_blocked(&url("http://0xa9fea9fe/latest"))); // the same, hex
+    // ALTERNATE IPv4 ENCODINGS. Worth being precise about what this proves, because the obvious
+    // reading is wrong: the URL parser canonicalizes every one of these to a dotted quad BEFORE the
+    // guard sees the host, so these assertions exercise the ordinary IPv4 branch, not the
+    // alternate-encoding branch. That is defence in depth working (the parser refuses to hand the
+    // guard an obfuscated host at all), and it is worth pinning, because a parser change that
+    // stopped canonicalizing would otherwise be silent. The alternate-encoding predicates
+    // themselves are covered directly above; their branch here is unreachable for http/https URLs.
+    assert!(host_is_blocked(&url("http://2852039166/latest"))); // 169.254.169.254 in decimal
+    assert!(host_is_blocked(&url("http://0xa9fea9fe/latest"))); // the same, in hex
+    assert!(host_is_blocked(&url("http://0251.0376.0251.0376/x"))); // the same, in octal
     assert!(host_is_blocked(&url("http://10.1/x"))); // short-dotted 10.0.0.1
                                                      // Alternate encodings OF loopback stay allowed, same carve-out as the dotted form.
     assert!(!host_is_blocked(&url("http://2130706433:8080/x")));
@@ -116,7 +122,15 @@ fn ipv6_embeddings_of_internal_ipv4_targets_are_blocked() {
     );
     assert!(host_is_blocked(&url("https://[64:ff9b::a9fe:a9fe]/latest")));
     assert!(host_is_blocked(&url("https://[64:ff9b::a00:1]/x"))); // 10.0.0.1
-                                                                  // 6to4, RFC 3056.
+                                                                  // RFC 8215 LOCAL-USE prefix. This is the one a deployment translating to RFC1918 space
+                                                                  // actually uses, because the well-known prefix may not be used with non-global IPv4.
+    assert_eq!(
+        embedded_v4(&"64:ff9b:1::a9fe:a9fe".parse().unwrap()),
+        Some(Ipv4Addr::new(169, 254, 169, 254))
+    );
+    assert!(host_is_blocked(&url("https://[64:ff9b:1::a9fe:a9fe]/x")));
+    assert!(host_is_blocked(&url("https://[64:ff9b:1::a00:1]/x")));
+    // 6to4, RFC 3056.
     assert_eq!(
         embedded_v4(&"2002:a00:1::".parse().unwrap()),
         Some(Ipv4Addr::new(10, 0, 0, 1))
@@ -176,6 +190,34 @@ fn errors_mask_embedded_userinfo() {
         "https://***@host/p?q=1"
     );
     assert_eq!(mask_userinfo(&url("https://host/p")), "https://host/p");
+}
+
+/// The status surface must not republish a query string. A sidecar authenticating by query
+/// parameter is common, and `status.settings.url` is operator-visible over the admin API and lands
+/// in any snapshot taken from it, so masking userinfo alone is not enough there.
+#[test]
+fn the_reportable_url_redacts_a_query_string_and_the_fragment() {
+    assert_eq!(
+        reportable_url(&url("https://hooks.example.com/route?token=eyJhbGciOi")),
+        "https://hooks.example.com/route?<redacted>"
+    );
+    assert_eq!(
+        reportable_url(&url(
+            "https://svc:hunter2@hooks.example.com/route?token=abc"
+        )),
+        "https://***@hooks.example.com/route?<redacted>"
+    );
+    // No query means the value is reported in full, so the drift check still works for the common
+    // case: the whole point of reporting `url` at all is that the engine compares it by name.
+    assert_eq!(
+        reportable_url(&url("https://hooks.example.com/route")),
+        "https://hooks.example.com/route"
+    );
+    // The fragment never reaches the wire, so it is dropped rather than echoed.
+    assert_eq!(
+        reportable_url(&url("https://hooks.example.com/route#frag")),
+        "https://hooks.example.com/route"
+    );
 }
 
 /// Regression for the TAB-in-scheme-separator masking bypass: WHATWG URL parsing (which

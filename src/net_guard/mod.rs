@@ -75,8 +75,20 @@ pub(crate) fn embedded_v4(addr: &Ipv6Addr) -> Option<Ipv4Addr> {
         return Some(v4);
     }
     let s = addr.segments();
-    // NAT64 well-known prefix: the IPv4 address is the last 32 bits.
-    if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
+    // NAT64 with the last 32 bits carrying the IPv4 address. Two prefixes, not one:
+    //   - the RFC 6052 WELL-KNOWN prefix `64:ff9b::/96`;
+    //   - the RFC 8215 LOCAL-USE prefix `64:ff9b:1::/48`, which exists precisely because the
+    //     well-known prefix may not be used with non-global IPv4 addresses. That is exactly the
+    //     RFC1918 case this guard cares about, so a deployment translating to internal space is
+    //     using the local-use prefix, not the well-known one. Matching only the well-known prefix
+    //     would have missed the deployments most likely to reach somewhere internal.
+    // Both are matched at /96 (the last two segments hold the address); for the /48 local-use
+    // prefix that means segments 3..5 must be zero for the address to sit at the /96 offset.
+    let nat64_wkp =
+        s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0;
+    let nat64_local =
+        s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 1 && s[3] == 0 && s[4] == 0 && s[5] == 0;
+    if nat64_wkp || nat64_local {
         return Some(Ipv4Addr::new(
             (s[6] >> 8) as u8,
             (s[6] & 0xff) as u8,
@@ -327,6 +339,29 @@ pub(crate) fn mask_userinfo(url: &reqwest::Url) -> String {
     let _ = masked.set_password(None);
     let _ = masked.set_username("***");
     masked.to_string()
+}
+
+/// The target URL in a form that is safe to publish on the operator-visible `status` surface.
+///
+/// `mask_userinfo` alone is not enough here. It masks credentials in the userinfo, which is the
+/// shape that shows up in an ERROR string, but a status field is different: it carries the whole
+/// URL, and a sidecar that authenticates by query parameter (`?token=...`) is a common enough shape
+/// that publishing the raw query would be a credential leak into the admin API and into every
+/// status snapshot taken from it. So the query is redacted to a marker rather than reproduced.
+///
+/// The fragment goes too: it never reaches the wire on an HTTP request, so it can only be noise or
+/// an accident, and there is no reason to echo it.
+pub(crate) fn reportable_url(url: &reqwest::Url) -> String {
+    let mut safe = url.clone();
+    safe.set_fragment(None);
+    let had_query = safe.query().is_some();
+    safe.set_query(None);
+    let base = mask_userinfo(&safe);
+    if had_query {
+        format!("{base}?<redacted>")
+    } else {
+        base
+    }
 }
 
 #[cfg(test)]

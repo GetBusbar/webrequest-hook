@@ -518,9 +518,16 @@ impl HookHandler for Forwarder {
                     // as `target_host` instead, `observed.get("url")` was always None, so the drift
                     // verdict was permanently true for every correctly-configured instance: the one
                     // signal that would catch a `url` push that did not take effect read identically
-                    // whether or not anything was wrong. Userinfo is masked, since this map is
-                    // operator-visible over the admin API.
-                    "url": crate::net_guard::mask_userinfo(&live.url),
+                    // whether or not anything was wrong.
+                    //
+                    // `reportable_url` masks userinfo AND redacts a query string. Reporting the raw
+                    // URL here would be a NEW leak: a hook sidecar that authenticates by query
+                    // parameter (`?token=...`) is a common shape, and this map is operator-visible
+                    // over the admin API and lands in any status snapshot. The cost is that a target
+                    // carrying a query shows drift, since the reported value deliberately is not the
+                    // pushed string; that is the right way round, because a false drift signal is
+                    // recoverable and a leaked bearer token is not.
+                    "url": crate::net_guard::reportable_url(&live.url),
                     // Kept alongside it: an operator reading status wants the host at a glance, and
                     // removing a field an existing dashboard may read is a gratuitous break.
                     "target_host": live.url.host_str().unwrap_or(""),
