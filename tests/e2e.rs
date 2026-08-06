@@ -10,8 +10,10 @@
 //! - forward decide → `order` / `abstain` / `reject` reply parsing (fail-closed);
 //! - forward transform → `rewrite` / `reject` / `abstain`;
 //! - notify is fire-and-forget (never errors);
-//! - oversized / malformed / deeply-nested reply → the forwarder returns `{}` → engine Abstain/on_error;
-//! - a slow target past the budget → `on_error`;
+//! - oversized / malformed / deeply-nested reply → the forwarder reports it could not answer, so the
+//!   engine runs `on_error` (a `decide` failure is NEVER coerced into an Abstain, or a gate the
+//!   operator configured to fail closed would fail open);
+//! - a slow target past the budget → the same failure path, `on_error`;
 //! - userinfo-leak masking on a transport error;
 //! - SSRF rejection of a blocked target at load.
 
@@ -444,7 +446,7 @@ async fn forward_posts_op_envelope_on_the_wire() {
 /// An oversized reply body (past the 64 KiB cap) → the forwarder returns `{}` → engine Abstain, never
 /// unbounded allocation, never a crash.
 #[tokio::test(flavor = "multi_thread")]
-async fn forward_oversized_reply_abstains() {
+async fn forward_oversized_reply_is_a_failure_not_an_abstain() {
     if plugin_path().is_none() {
         return;
     }
@@ -457,13 +459,13 @@ async fn forward_oversized_reply_abstains() {
     let d = policy
         .decide(&req_with_prompt("x"), &[cand(0)], &ctx(), BUDGET)
         .await
-        .expect("oversize reply must degrade to Abstain, not error");
-    assert_eq!(d, RoutingDecision::Abstain);
+        .expect_err("an oversize reply means the hook could not answer, so it must reach the engine as a failure and let on_error resolve");
+    assert!(format!("{d:?}").contains("could not answer"), "{d:?}");
 }
 
 /// A malformed (non-JSON) reply → the forwarder returns `{}` → engine Abstain.
 #[tokio::test(flavor = "multi_thread")]
-async fn forward_malformed_reply_abstains() {
+async fn forward_malformed_reply_is_a_failure_not_an_abstain() {
     if plugin_path().is_none() {
         return;
     }
@@ -472,14 +474,17 @@ async fn forward_malformed_reply_abstains() {
     let d = policy
         .decide(&req_with_prompt("x"), &[cand(0)], &ctx(), BUDGET)
         .await
-        .expect("malformed reply degrades to Abstain");
-    assert_eq!(d, RoutingDecision::Abstain);
+        .expect_err(
+            "a malformed reply means the hook could not answer, not that it had no opinion",
+        );
+    assert!(format!("{d:?}").contains("could not answer"), "{d:?}");
 }
 
-/// A deeply-nested reply (~150 deep, under the size cap) is rejected by the depth guard BEFORE parse →
-/// the forwarder returns `{}` → engine Abstain (never a recursive deserialize that could blow the stack).
+/// A deeply-nested reply (~150 deep, under the size cap) is rejected by the depth guard BEFORE parse,
+/// and that rejection reaches the engine as a failure (never a recursive deserialize that could blow
+/// the stack, and never a silent Abstain that would strand a fail-closed gate).
 #[tokio::test(flavor = "multi_thread")]
-async fn forward_deeply_nested_reply_abstains() {
+async fn forward_deeply_nested_reply_is_a_failure_not_an_abstain() {
     if plugin_path().is_none() {
         return;
     }
@@ -495,14 +500,14 @@ async fn forward_deeply_nested_reply_abstains() {
     let d = policy
         .decide(&req_with_prompt("x"), &[cand(0)], &ctx(), BUDGET)
         .await
-        .expect("deep reply degrades to Abstain");
-    assert_eq!(d, RoutingDecision::Abstain);
+        .expect_err("a reply the depth guard refuses to parse means the hook could not answer");
+    assert!(format!("{d:?}").contains("could not answer"), "{d:?}");
 }
 
-/// A 5xx / 4xx target response → the forwarder returns `{}` → engine Abstain (a bad status is a
-/// no-opinion, coerced to the on_error chain by the engine, never a silent route on the error body).
+/// A 5xx / 4xx target response is a FAILURE, not a no-opinion: it reaches the engine as an error so
+/// the operator's `on_error` chain decides, and it never routes on the error body.
 #[tokio::test(flavor = "multi_thread")]
-async fn forward_error_status_abstains() {
+async fn forward_error_status_is_a_failure_not_an_abstain() {
     if plugin_path().is_none() {
         return;
     }
@@ -512,15 +517,19 @@ async fn forward_error_status_abstains() {
         let d = policy
             .decide(&req_with_prompt("x"), &[cand(0)], &ctx(), BUDGET)
             .await
-            .expect("error status degrades to Abstain");
-        assert_eq!(d, RoutingDecision::Abstain, "HTTP {status} must abstain");
+            .expect_err("a bad status means the hook could not answer");
+        assert!(
+            format!("{d:?}").contains("could not answer"),
+            "HTTP {status} must reach the engine as a failure, got {d:?}"
+        );
     }
 }
 
-/// A target slower than the op budget → the forwarder's tight timeout fires, it returns `{}`, and the
-/// deadline cuts off promptly (the blocking HTTP call never stalls the engine's runtime).
+/// A target slower than the op budget: the forwarder's tight timeout fires, the timeout reaches the
+/// engine as a failure rather than a no-opinion, and it cuts off promptly (the blocking HTTP call
+/// never stalls the engine's runtime).
 #[tokio::test(flavor = "multi_thread")]
-async fn forward_slow_target_times_out_promptly() {
+async fn forward_slow_target_times_out_promptly_as_a_failure() {
     if plugin_path().is_none() {
         return;
     }
@@ -532,8 +541,8 @@ async fn forward_slow_target_times_out_promptly() {
     let d = policy
         .decide(&req_with_prompt("x"), &[cand(0)], &ctx(), BUDGET)
         .await
-        .expect("a slow target degrades to Abstain via the plugin timeout");
-    assert_eq!(d, RoutingDecision::Abstain);
+        .expect_err("a timed-out target means the hook could not answer");
+    assert!(format!("{d:?}").contains("could not answer"), "{d:?}");
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "the plugin timeout must cut off promptly, got {:?}",
@@ -574,9 +583,10 @@ fn load_rejects_ssrf_blocked_target() {
 }
 
 /// Userinfo masking: a transport error against an unroutable `user:pass@` URL must not leak the
-/// credential. The forwarder returns `{}` (Abstain) rather than surfacing the error to the engine, so
-/// there is no path for the credential to reach a log — this asserts the load succeeds (external host)
-/// and the failing decide degrades cleanly.
+/// credential. The error IS surfaced to the engine now (that is what makes `on_error` reachable), and
+/// the engine logs it, so the message itself is the thing that has to be clean. This inspects the
+/// surfaced string: it must name the failure without carrying the password, the userinfo pair, or the
+/// bare username.
 #[tokio::test(flavor = "multi_thread")]
 async fn forward_transport_error_never_leaks_userinfo() {
     if plugin_path().is_none() {
@@ -595,8 +605,15 @@ async fn forward_transport_error_never_leaks_userinfo() {
             Duration::from_secs(2),
         )
         .await
-        .expect("an unroutable target degrades to Abstain (no error surfaced, no credential path)");
-    assert_eq!(d, RoutingDecision::Abstain);
+        .expect_err("an unroutable target means the hook could not answer");
+    let msg = format!("{d:?}");
+    assert!(msg.contains("could not answer"), "{msg}");
+    for secret in ["hunter2", "svc:hunter2", "svc@"] {
+        assert!(
+            !msg.contains(secret),
+            "the surfaced error leaked {secret:?} from the target URL userinfo: {msg}"
+        );
+    }
 }
 
 /// `configure` over the seam: a good pushed URL ACKs (Ok); an SSRF-blocked pushed URL NACKs (Err — the

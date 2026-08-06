@@ -219,9 +219,13 @@ impl Forwarder {
             .as_ref()
             .expect("forwarder runtime present until drop");
         rt.block_on(async {
-            // `.without_url()` on every reqwest error: a reqwest error's Display carries the request URL
-            // WITH any embedded `user:pass@` userinfo. This error can reach operator logs, so the URL is
-            // stripped before it is formatted. Parity with the old webhook hardening.
+            // `.without_url()` on every reqwest error. This error now REACHES the operator (a failed
+            // `decide` is reported as a failure so `on_error` can resolve it), so it lands in logs and
+            // must not carry the target's `user:pass@` userinfo. The reqwest in use today already
+            // redacts credentials when it formats a URL, so this is the second of two layers, not the
+            // only one — which is why `forward_transport_error_never_leaks_userinfo` asserts the
+            // property of the SURFACED STRING rather than of this call. Keep both: the guarantee should
+            // not silently become a dependency's to make.
             let resp = self
                 .client
                 .post(target_url)
@@ -394,10 +398,22 @@ impl HookHandler for Forwarder {
     /// because every workaround available here (a deliberate protocol violation to trigger
     /// `on_error`) is worse than the gap.
     fn decide(&self, payload: &serde_json::Value) -> serde_json::Value {
-        match self.post_op("decide", payload) {
-            Ok(reply) => reply,
-            Err(_) => serde_json::json!({}),
-        }
+        // Kept for the infallible trait surface; `decide_result` is the one the SDK calls.
+        self.decide_result(payload)
+            .unwrap_or_else(|_| serde_json::json!({}))
+    }
+
+    /// The fallible entry point. A transport, status, size-cap or parse failure means this hook
+    /// COULD NOT ANSWER, which is not the same as having no opinion, and the engine acts on the
+    /// difference: an abstain lets the request proceed, a failure resolves the operator's
+    /// `on_error` chain, whose terminal can be `reject`.
+    ///
+    /// This was previously impossible to express. The trait had no error variant, so a gate whose
+    /// remote brain was down returned `{}` and an operator who had configured `on_error: reject`
+    /// silently did not get it: the request went through unscreened. The ABI now carries the
+    /// distinction, so report it.
+    fn decide_result(&self, payload: &serde_json::Value) -> Result<serde_json::Value, String> {
+        self.post_op("decide", payload)
     }
 
     /// `transform` — POST the projection, return the reply verbatim. On error return `{}` (abstain,
