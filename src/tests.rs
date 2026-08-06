@@ -70,10 +70,9 @@ fn parse_reply_depth_and_length_only_errors() {
 /// NOTE the boundary this test pins is depth 127, not `MAX_REPLY_DEPTH` (128) as the module doc
 /// comment claims ("depth-guarded at 128 levels"): `serde_json`'s OWN internal recursion limit
 /// rejects a depth-128 document before `exceeds_max_depth`'s pre-check is even the deciding factor
-/// (verified empirically: depth 127 parses, depth 128 fails serde_json's own parse regardless of our
-/// pre-check's `128 > 128` being false). So the crate's real, usable ceiling is one level lower than
-/// documented — this test pins the TRUE observed behavior; the one-off doc claim is a separate,
-/// low-severity craft fix.
+/// (depth 127 parses; depth 128 fails serde_json's own parse regardless of the pre-check's
+/// `128 > 128` being false). The crate's real, usable ceiling is therefore one level lower than the
+/// module doc states, and this test pins the observed behaviour.
 #[test]
 fn parse_reply_depth_boundary_is_exact() {
     let nested = |n: usize| {
@@ -113,9 +112,9 @@ fn envelope_wraps_a_non_object_payload_under_payload_key() {
 /// never contain the `op` key twice, even when the projected payload itself carries a top-level `op`
 /// field.
 ///
-/// RED (pre-fix): the payload's own `"op":"whatever"` and the discriminator's `"op":"decide"` are
-/// both written to the byte stream — two `"op":` occurrences.
-/// GREEN: the payload's `op` key is skipped; only the discriminator's `op` is emitted.
+/// Without the skip, the payload's own `"op":"whatever"` and the discriminator's `"op":"decide"`
+/// are both written to the byte stream — two `"op":` occurrences. As implemented, the payload's `op`
+/// key is skipped and only the discriminator's `op` is emitted.
 #[test]
 fn envelope_byte_serialization_never_duplicates_the_op_key() {
     let payload = serde_json::json!({
@@ -160,8 +159,7 @@ fn request_envelope_merges_op_and_preserves_projection() {
 /// `Abstain`, which is guaranteed unconditionally by that discard regardless of whether the masking
 /// itself still works). This test calls `post_op` directly and inspects the real error string.
 ///
-/// RED (pre-fix, i.e. `.without_url()` removed): the error string would contain `hunter2`.
-/// GREEN: it never does.
+/// Without `.without_url()`, the error string would contain `hunter2`. As implemented it never does.
 #[test]
 fn post_op_error_string_never_contains_url_userinfo() {
     let fwd = Forwarder::new(Config {
@@ -237,10 +235,10 @@ fn configure_revalidates_pushed_url() {
 /// A pushed `url` that's PRESENT but not a string (a templating bug rendering it as a number or
 /// null) must NACK, not be treated identically to an absent key.
 ///
-/// RED (pre-fix): `settings.get("url").and_then(|v| v.as_str())` yields `None` for a non-string
-/// value exactly as it does for a missing key, so this fell into the same "nothing to check, ACK"
-/// arm as a genuinely absent url.
-/// GREEN: a present-but-wrong-typed url is distinguished and NACKs.
+/// A bare `settings.get("url").and_then(|v| v.as_str())` yields `None` for a non-string value
+/// exactly as it does for a missing key, which would fall into the same "nothing to check, ACK" arm
+/// as a genuinely absent url. As implemented, a present-but-wrong-typed url is distinguished and
+/// NACKs.
 #[test]
 fn configure_nacks_a_present_but_wrong_typed_url() {
     let fwd = Forwarder::new(Config {
@@ -293,13 +291,12 @@ fn timeout_ms_is_clamped_to_max_timeout_ms() {
     );
 }
 
-/// RED (pre-fix): `configure` validated a pushed `url` against the SSRF guard and ACKed, but never
-/// actually updated the live forwarder — every subsequent `decide`/`transform`/`notify` kept posting to
-/// the URL from `open`, silently, forever (until an unrelated future plugin reload). That breaks
-/// Busbar's own documented contract for this op (`docs/admin-api.md`'s `PATCH /hooks/{name}/settings`:
-/// "commit on ack", no restart-to-apply carve-out for hooks) — an operator's PATCH would report success
-/// while nothing actually changed.
-/// GREEN: a committed (ACKed) `url` push is visible immediately via `status()`.
+/// Validating a pushed `url` against the SSRF guard and ACKing without updating the live forwarder
+/// would leave every subsequent `decide`/`transform`/`notify` posting to the URL from `open`,
+/// silently, until an unrelated plugin reload. That would break busbar's documented contract for this
+/// op (`docs/admin-api.md`'s `PATCH /hooks/{name}/settings`: "commit on ack", no restart-to-apply
+/// carve-out for hooks) — an operator's PATCH would report success while nothing changed. As
+/// implemented, a committed (ACKed) `url` push is visible immediately via `status()`.
 #[test]
 fn configure_commits_a_new_url_to_the_live_target() {
     let fwd = Forwarder::new(Config {
@@ -384,7 +381,7 @@ fn configure_nacks_a_present_but_wrong_typed_timeout_and_does_not_partially_appl
 /// forwarder with it — can drop on a tokio async thread. A bare `Runtime` dropped there panics
 /// ("Cannot drop a runtime in a context where blocking is not allowed"), which the SDK's
 /// `ffi_guard` would catch and LEAK the handle. The `Drop` impl's `shutdown_background()` makes
-/// the drop non-blocking, so no panic fires. Before the fix this test panicked/aborted.
+/// the drop non-blocking, so no panic fires.
 #[test]
 fn drop_in_async_context_does_not_panic() {
     // A MULTI-thread runtime with worker threads: `block_on` here runs on a thread that IS a

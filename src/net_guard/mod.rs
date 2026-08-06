@@ -23,8 +23,8 @@
 //! `is_link_local_v6`, `is_alternate_ipv4_encoding`) are lifted verbatim from
 //! `busbar/src/net_guard.rs`. A plugin cdylib must NOT depend on the `busbar` core crate (it would pull
 //! the whole engine into a leaf `cdylib` and invert the plugin/core boundary), so the identical
-//! security atoms are copied here. The design spec explicitly calls for the SSRF guard to LIVE in this
-//! plugin. If these are ever hoisted into a tiny no-dep shared leaf crate, this copy should reference
+//! security atoms are copied here; the SSRF guard belongs in the plugin that opens the socket.
+//! If these are ever hoisted into a tiny no-dep shared leaf crate, this copy should reference
 //! it; until then the copies must be kept byte-identical — a contributor hardening one against a new
 //! obfuscation form must harden both. The tests below pin THIS COPY's behaviour against fixed test
 //! vectors (obfuscated-encoding forms, RFC1918/CGNAT/ULA/link-local/metadata hosts, the loopback

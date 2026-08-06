@@ -110,13 +110,10 @@ async fn mock_target_bytes(status: u16, body: Vec<u8>) -> String {
 /// `<profile_dir>/deps/<name>` (the raw compiler output, refreshed on EVERY build that recompiles
 /// the lib, uplifted or not — a cdylib's filename in `deps/` is never hash-suffixed, since a single
 /// package produces at most one). A bare `cargo test` with no prior `--all-targets`/`--lib` build
-/// (exactly what `cargo mutants`'s default build step runs, and what a developer running `cargo
-/// test` alone locally gets) recompiles the mutated/edited source but does NOT uplift it — checking
-/// only `profile_dir` in that case silently finds a STALE (or absent) top-level copy and every test
-/// below no-ops via this function's `None` return, appearing to pass without exercising a single
-/// line of the real cdylib. Confirmed by hand: deleting both candidates and running the exact
-/// `cargo test` invocation `cargo-mutants` uses left `profile_dir` empty while `profile_dir/deps`
-/// held the freshly-built dylib. Preferring whichever candidate has the newer mtime (falling back to
+/// recompiles the edited source but does NOT uplift it — checking only `profile_dir` in that case
+/// silently finds a STALE (or absent) top-level copy and every test below no-ops via this function's
+/// `None` return, appearing to pass without exercising a single line of the real cdylib.
+/// Preferring whichever candidate has the newer mtime (falling back to
 /// whichever exists) is correct regardless of which build step ran last.
 fn plugin_path() -> Option<std::path::PathBuf> {
     let candidate = (|| {
@@ -287,8 +284,8 @@ fn req_with_prompt(text: &str) -> RoutingRequest<'static> {
         }),
         identity: None,
         // The DEFAULT (empty) declared-signal bag. The forwarder declares no signals, so this is
-        // exactly what the engine hands it on every real request — the default path these tests
-        // exercise — not a placeholder for missing coverage.
+        // exactly what the engine hands it on every real request, and the default path these tests
+        // exercise.
         signals: Default::default(),
     }
 }

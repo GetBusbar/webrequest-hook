@@ -13,8 +13,7 @@
 //! over api and actually tested" bar applied to a `kind: hook` plugin, mirroring the pattern
 //! `GetBusbar/busbar/.github/workflows/plugin-ci.yml`'s INSTALL-AND-SERVE step already applies to
 //! `kind: store` plugins (that step is gated `if: inputs.plugin_kind == 'store'` and does not cover
-//! hooks at all — this test is the hook-shaped equivalent, self-contained in THIS repo's own
-//! `cargo test` rather than a change to the shared reusable workflow).
+//! hooks at all, so the hook-shaped equivalent lives here, in this repo's own `cargo test`).
 //!
 //! The proof chain, all real:
 //!   1. Build a genuinely SIGNED plugin tarball (ed25519, `busbar_plugin_sign::sign`, the exact
@@ -107,9 +106,9 @@ fn busbar_bin() -> Option<PathBuf> {
 /// Checks BOTH the "uplifted" `<profile_dir>/<name>` copy (only refreshed when `[lib]` is a ROOT
 /// build target, e.g. `cargo build --all-targets`) and the raw `<profile_dir>/deps/<name>` compiler
 /// output (refreshed on every build that recompiles the lib) — see `tests/e2e.rs`'s `plugin_path()`
-/// doc comment for the full story: a bare `cargo test` (what `cargo-mutants` runs, and what a
-/// developer gets locally without an explicit prior build) does NOT uplift the top-level copy, so
-/// checking only that path finds nothing / something stale and this test silently no-ops.
+/// doc comment for the detail: a bare `cargo test` with no explicit prior build does NOT uplift the
+/// top-level copy, so checking only that path finds nothing / something stale and this test silently
+/// no-ops.
 fn webrequest_cdylib() -> Option<PathBuf> {
     let candidate = (|| {
         let exe = std::env::current_exe().ok()?;

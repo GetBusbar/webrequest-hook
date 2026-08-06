@@ -8,11 +8,9 @@
 # BUSBAR_SIGN_KEY-or-`--allow-unsigned` fallback, same `gh release upload` + build-provenance
 # attestation — just scoped to this one plugin.
 #
-# REPLACES the old stopgap workflow, which only built and uploaded the UNSIGNED raw cdylib
-# (busbar-plugin-pack lived only in the still-private busbarAI monorepo at the time, so
-# packing/signing was a manual follow-up step against this workflow's artifacts). busbar-plugin-pack
-# is built here from a sibling busbar checkout instead, exactly like every other first-party plugin
-# repo, so this workflow now produces the real signed, loadable tarball directly.
+# busbar-plugin-pack is built here from a sibling busbar checkout, exactly like every other
+# first-party plugin repo, so this workflow produces the real signed, loadable tarball directly
+# rather than a raw unsigned cdylib needing a manual packing step.
 #
 # This plugin's own version (the `v*` tag pushed here) is NOT tied to busbar's version number —
 # see other first-party plugin repos for the same convention.
@@ -156,10 +154,10 @@ jobs:
   # PHANTOM-RELEASE GUARD: assert the published Release actually carries assets before we treat this
   # as a real release. The per-target build/upload jobs run with fail-fast:false, and `create-release`
   # always makes the (initially empty) Release up front — so a build/pack failure on EVERY target
-  # (e.g. a stale Cargo.lock tripping `--locked`, as happened on the first v1.0.3 cut) leaves a tag +
-  # Release with ZERO assets: a "phantom" that silently breaks busbar's plugin-registry-gate. This job
-  # fails the whole release run loud if assets == 0, so a phantom can never ship (or notify marketing)
-  # unnoticed again. It depends on the build matrix but does NOT inherit its fail-fast:false — one
+  # (e.g. a stale Cargo.lock tripping `--locked`) leaves a tag + Release with ZERO assets: a
+  # "phantom" that silently breaks busbar's plugin-registry-gate. This job fails the whole release run
+  # loud if assets == 0, so a phantom can never ship, or notify marketing, unnoticed. It depends on
+  # the build matrix but does NOT inherit its fail-fast:false — one
   # green target is enough to have assets, but zero across the board must hard-fail here.
   verify-assets:
     needs: [webrequest-plugin]
