@@ -9,7 +9,7 @@ that reply, so this plugin is a pure network relay — it adds a hop, never
 a second copy of the hook wire semantics.
 
 It is a `cdylib` that implements busbar's `HookHandler` trait (via
-[`busbar-plugin-sdk`](https://github.com/GetBusbar/busbarAI/tree/main/crates/plugin-sdk))
+[`busbar-plugin-sdk`](https://github.com/GetBusbar/busbar/tree/main/crates/plugin-sdk))
 and is loaded in-process by busbar over the signed hybrid plugin ABI —
 `dlopen`'d, not spawned as a separate process.
 
@@ -25,7 +25,7 @@ and is loaded in-process by busbar over the signed hybrid plugin ABI —
 
 ## The security stance
 
-- **SSRF-guarded** (`src/net_guard.rs`): the configured URL is validated
+- **SSRF-guarded** (`src/net_guard/mod.rs`): the configured URL is validated
   at `open`/`configure` — loopback sidecars are allowed; link-local /
   IMDS / RFC1918 / CGNAT / ULA / cloud-metadata / alternate-IPv4
   encodings are blocked; plaintext `http://` is permitted only to
@@ -45,12 +45,12 @@ and is loaded in-process by busbar over the signed hybrid plugin ABI —
   content only if the operator also grants it.
 
 See the doc comments at the top of [`src/lib.rs`](src/lib.rs) and
-[`src/net_guard.rs`](src/net_guard.rs) for the full design rationale.
+[`src/net_guard/mod.rs`](src/net_guard/mod.rs) for the full design rationale.
 
 ## Build
 
 Needs a Rust toolchain ([rustup](https://rustup.rs)), and — interim,
-until [busbarAI](https://github.com/GetBusbar/busbarAI) ships publicly —
+until [busbarAI](https://github.com/GetBusbar/busbar) ships publicly —
 a sibling checkout of `busbarAI` at `../busbarAI` (see
 [Dependencies](#dependencies) below).
 
@@ -65,7 +65,7 @@ cargo fmt --all -- --check
 
 This crate depends on `busbar-plugin-sdk` (and, as dev-dependencies for
 the end-to-end test, `busbar-plugin-loader` and `busbar-api`) from the
-[busbarAI](https://github.com/GetBusbar/busbarAI) monorepo. Because
+[busbarAI](https://github.com/GetBusbar/busbar) monorepo. Because
 busbarAI is not yet public, `Cargo.toml` points at these as **local path
 dependencies** (`../busbarAI/crates/...`), which means this repo expects
 to be checked out as a sibling of `busbarAI`:
@@ -84,7 +84,7 @@ become git (pinned rev/tag) or crates.io dependencies instead. Grep
 
 Once built, the cdylib is packed and signed like any other busbar plugin
 — see
-[`docs/plugins.md`](https://github.com/GetBusbar/busbarAI/blob/main/docs/plugins.md#signing-and-packaging)
+[`docs/plugins.md`](https://github.com/GetBusbar/busbar/blob/main/docs/plugins.md#signing-and-packaging)
 in busbarAI for the full reference. In short:
 
 ```sh
@@ -107,7 +107,7 @@ development without a signing key, `busbar-plugin-pack pack
 
 Drop the resulting tarball into busbar's configured `plugins.dir` and
 reference it as a hook module — see
-[`docs/plugins.md`](https://github.com/GetBusbar/busbarAI/blob/main/docs/plugins.md#hook-plugins-kind-hook)
+[`docs/plugins.md`](https://github.com/GetBusbar/busbar/blob/main/docs/plugins.md#hook-plugins-kind-hook)
 for the `hooks:` wiring (`kind: hook`, `settings: { url: ... }`).
 
 ## Config
@@ -119,7 +119,7 @@ for the `hooks:` wiring (`kind: hook`, `settings: { url: ... }`).
 
 ## Tests
 
-`cargo test` runs both the pure unit tests (`src/lib.rs`, `src/net_guard.rs`
+`cargo test` runs both the pure unit tests (`src/lib.rs`, `src/net_guard/mod.rs`
 — SSRF predicates, reply parsing/depth guard, envelope shaping) and the
 end-to-end test in `tests/e2e.rs`, which loads the *built* cdylib over
 the real `busbar-plugin-loader` ABI seam against a local mock HTTP

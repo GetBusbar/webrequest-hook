@@ -377,9 +377,22 @@ fn request_envelope(op: &str, payload: &serde_json::Value) -> serde_json::Value 
 }
 
 impl HookHandler for Forwarder {
-    /// `decide` — POST the projection, return the reply verbatim. On any transport/parse error, return
-    /// `{}` (abstain): the engine's normalizer maps that to `Abstain`, and the fail-closed
-    /// on_error/on_empty chain takes over — the retired webhook's "no opinion on error" guarantee.
+    /// `decide` — POST the projection, return the reply verbatim.
+    ///
+    /// On any transport, status, size-cap or parse failure this returns `{}`, which the engine's
+    /// normalizer reads as `Abstain`. Stated precisely, because the previous wording here was wrong
+    /// and the difference is the whole safety story: **abstain is not the operator's `on_error`
+    /// chain.** `on_error` fires when the engine's own call to the plugin fails or violates the
+    /// protocol; a plugin that answers `{}` has answered successfully, with no opinion. So a gate
+    /// whose remote brain is down contributes nothing and the request proceeds unscreened, and an
+    /// operator who configured `on_error: reject` does not get it.
+    ///
+    /// This is NOT something the plugin can fix on its own: `HookHandler::decide` returns a
+    /// `serde_json::Value`, with no error variant, so there is no way from in here to tell the
+    /// engine that the call failed rather than abstained. Closing it needs an error channel on the
+    /// hook ABI. Recorded in the repo's latent-hazards note rather than worked around locally,
+    /// because every workaround available here (a deliberate protocol violation to trigger
+    /// `on_error`) is worse than the gap.
     fn decide(&self, payload: &serde_json::Value) -> serde_json::Value {
         match self.post_op("decide", payload) {
             Ok(reply) => reply,
@@ -387,8 +400,10 @@ impl HookHandler for Forwarder {
         }
     }
 
-    /// `transform` — POST the projection, return the reply verbatim. On error return `{}` (abstain →
+    /// `transform` — POST the projection, return the reply verbatim. On error return `{}` (abstain,
     /// proceed with the ORIGINAL body); a parsed `reject` in the reply is honored by the engine.
+    /// Unlike `decide`, nothing is lost here: the loader already coerces its own errors to `Abstain`
+    /// on this path, so the plugin's `{}` and an engine-side failure are the same outcome by design.
     fn transform(&self, payload: &serde_json::Value) -> serde_json::Value {
         match self.post_op("transform", payload) {
             Ok(reply) => reply,
@@ -498,7 +513,16 @@ impl HookHandler for Forwarder {
         serde_json::json!({
             "status": {
                 "settings": {
-                    // Host only (no path/query/userinfo) — enough for an operator to see WHERE it forwards.
+                    // Reported under the SAME key the operator pushes (`url`), because the engine's
+                    // settings-drift check compares desired keys against this map by name. Reported
+                    // as `target_host` instead, `observed.get("url")` was always None, so the drift
+                    // verdict was permanently true for every correctly-configured instance: the one
+                    // signal that would catch a `url` push that did not take effect read identically
+                    // whether or not anything was wrong. Userinfo is masked, since this map is
+                    // operator-visible over the admin API.
+                    "url": crate::net_guard::mask_userinfo(&live.url),
+                    // Kept alongside it: an operator reading status wants the host at a glance, and
+                    // removing a field an existing dashboard may read is a gratuitous break.
                     "target_host": live.url.host_str().unwrap_or(""),
                     "timeout_ms": live.timeout.as_millis() as u64
                 },
