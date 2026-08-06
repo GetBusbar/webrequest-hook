@@ -582,20 +582,28 @@ fn load_rejects_ssrf_blocked_target() {
     }
 }
 
-/// Userinfo masking: a transport error against an unroutable `user:pass@` URL must not leak the
-/// credential. The error IS surfaced to the engine now (that is what makes `on_error` reachable), and
-/// the engine logs it, so the message itself is the thing that has to be clean. This inspects the
-/// surfaced string: it must name the failure without carrying the password, the userinfo pair, or the
-/// bare username.
+/// Credential masking on a surfaced transport error. The error now REACHES the engine (that is what
+/// makes `on_error` reachable) and the engine logs it, so the message itself has to be clean.
+///
+/// The URL carries BOTH shapes of embedded credential, and the query string is the one that matters.
+/// reqwest strips `user:pass@` off the URL into an auth header before the request is ever made, so a
+/// userinfo-only assertion here passes even with the plugin's own `.without_url()` masking deleted —
+/// it cannot fail, and an earlier version of this test was exactly that vacuous. reqwest does NOT
+/// strip the QUERY, so `?token=...` (the sidecar auth shape `status()` already masks for the same
+/// reason) is carried by the error verbatim and `.without_url()` is the only thing removing it.
+/// Asserting on both keeps the userinfo regression covered and gives the test something it can
+/// actually fail on.
 #[tokio::test(flavor = "multi_thread")]
 async fn forward_transport_error_never_leaks_userinfo() {
     if plugin_path().is_none() {
         return;
     }
     // RFC 5737 TEST-NET-1 is unroutable → the POST fails fast. userinfo embedded in the URL.
-    let settings =
-        serde_json::json!({ "url": "https://svc:hunter2@192.0.2.1/route", "timeout_ms": 300 })
-            .to_string();
+    let settings = serde_json::json!({
+        "url": "https://svc:hunter2@192.0.2.1/route?token=SUPERSECRET&x=1",
+        "timeout_ms": 300
+    })
+    .to_string();
     let policy = load(&settings);
     let d = policy
         .decide(
@@ -608,10 +616,10 @@ async fn forward_transport_error_never_leaks_userinfo() {
         .expect_err("an unroutable target means the hook could not answer");
     let msg = format!("{d:?}");
     assert!(msg.contains("could not answer"), "{msg}");
-    for secret in ["hunter2", "svc:hunter2", "svc@"] {
+    for secret in ["SUPERSECRET", "token=", "hunter2", "svc:hunter2", "svc@"] {
         assert!(
             !msg.contains(secret),
-            "the surfaced error leaked {secret:?} from the target URL userinfo: {msg}"
+            "the surfaced error leaked {secret:?} from the target URL: {msg}"
         );
     }
 }

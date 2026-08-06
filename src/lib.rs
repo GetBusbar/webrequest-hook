@@ -220,12 +220,16 @@ impl Forwarder {
             .expect("forwarder runtime present until drop");
         rt.block_on(async {
             // `.without_url()` on every reqwest error. This error now REACHES the operator (a failed
-            // `decide` is reported as a failure so `on_error` can resolve it), so it lands in logs and
-            // must not carry the target's `user:pass@` userinfo. The reqwest in use today already
-            // redacts credentials when it formats a URL, so this is the second of two layers, not the
-            // only one — which is why `forward_transport_error_never_leaks_userinfo` asserts the
-            // property of the SURFACED STRING rather than of this call. Keep both: the guarantee should
-            // not silently become a dependency's to make.
+            // `decide` is reported as a failure so `on_error` can resolve it), so it lands in the
+            // engine's warn log on every affected request and must not carry the target's credentials.
+            //
+            // Which credentials this is actually protecting, precisely, because getting it wrong once
+            // already produced a test that could not fail: reqwest strips `user:pass@` off the URL
+            // into an auth header BEFORE the request runs, so the userinfo is masked whatever this
+            // crate does. It does NOT touch the query string. So `.without_url()` is the only thing
+            // removing a `?token=...` — the sidecar auth shape `status()` masks for the same reason —
+            // and `forward_transport_error_never_leaks_userinfo` asserts exactly that, on the surfaced
+            // string, with a `?token=` in the URL so deleting this call fails it.
             let resp = self
                 .client
                 .post(target_url)
@@ -381,22 +385,21 @@ fn request_envelope(op: &str, payload: &serde_json::Value) -> serde_json::Value 
 }
 
 impl HookHandler for Forwarder {
-    /// `decide` — POST the projection, return the reply verbatim.
+    /// `decide` — the infallible trait surface, kept only because the trait defines it. The SDK
+    /// dispatches through [`Self::decide_result`], which this crate overrides, so nothing reaches
+    /// this method in practice.
     ///
-    /// On any transport, status, size-cap or parse failure this returns `{}`, which the engine's
-    /// normalizer reads as `Abstain`. Stated precisely, because the previous wording here was wrong
-    /// and the difference is the whole safety story: **abstain is not the operator's `on_error`
-    /// chain.** `on_error` fires when the engine's own call to the plugin fails or violates the
-    /// protocol; a plugin that answers `{}` has answered successfully, with no opinion. So a gate
-    /// whose remote brain is down contributes nothing and the request proceeds unscreened, and an
-    /// operator who configured `on_error: reject` does not get it.
+    /// It used to be the real implementation, and it returned `{}` on any transport, status,
+    /// size-cap or parse failure — which the engine's normalizer reads as `Abstain`. That was the
+    /// whole safety story, and it was the wrong end of it: **abstain is not the operator's
+    /// `on_error` chain.** `on_error` fires when the engine's call to the plugin fails; a plugin
+    /// that answers `{}` has answered successfully, with no opinion. So a gate whose remote brain
+    /// was down contributed nothing, the request proceeded unscreened, and an operator who
+    /// configured `on_error: reject` never got it.
     ///
-    /// This is NOT something the plugin can fix on its own: `HookHandler::decide` returns a
-    /// `serde_json::Value`, with no error variant, so there is no way from in here to tell the
-    /// engine that the call failed rather than abstained. Closing it needs an error channel on the
-    /// hook ABI. Recorded in the repo's latent-hazards note rather than worked around locally,
-    /// because every workaround available here (a deliberate protocol violation to trigger
-    /// `on_error`) is worse than the gap.
+    /// That could not be fixed from inside the plugin: `HookHandler::decide` returns a
+    /// `serde_json::Value` with no error variant. It took an error channel on the hook ABI, which
+    /// now exists as `HookReply::Failed` — see [`Self::decide_result`].
     fn decide(&self, payload: &serde_json::Value) -> serde_json::Value {
         // Kept for the infallible trait surface; `decide_result` is the one the SDK calls.
         self.decide_result(payload)

@@ -152,14 +152,16 @@ fn request_envelope_merges_op_and_preserves_projection() {
     assert_eq!(env["candidates"][0]["idx"], 0);
 }
 
-/// `post_op`'s transport-error string is userinfo-masked even when the target URL embeds a
-/// credential — the actual property `tests/e2e.rs`'s
-/// `forward_transport_error_never_leaks_userinfo` is NAMED for but cannot observe, since `decide()`
-/// discards the `Err` payload before it reaches anything the e2e test can inspect (it only ever sees
-/// `Abstain`, which is guaranteed unconditionally by that discard regardless of whether the masking
-/// itself still works). This test calls `post_op` directly and inspects the real error string.
+/// `post_op`'s transport-error string is masked even when the target URL embeds a credential. The
+/// e2e test of the same property now works too (a `decide` failure reaches the engine rather than
+/// being discarded as an `Abstain`), so this is the narrower unit-level twin of it.
 ///
-/// Without `.without_url()`, the error string would contain `hunter2`. As implemented it never does.
+/// NOT "without `.without_url()` this would contain `hunter2`" — it would not, and this comment used
+/// to claim it did. reqwest strips `user:pass@` off the URL into an auth header before the request
+/// is made, so the userinfo is gone whatever this crate does. What `.without_url()` actually removes
+/// is the QUERY STRING, which reqwest preserves verbatim; `tests/e2e.rs`'s
+/// `forward_transport_error_never_leaks_userinfo` is the one that asserts it, because that is where
+/// a `?token=` can be injected through the real config seam.
 #[test]
 fn post_op_error_string_never_contains_url_userinfo() {
     let fwd = Forwarder::new(Config {
