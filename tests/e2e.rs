@@ -110,14 +110,13 @@ async fn mock_target_bytes(status: u16, body: Vec<u8>) -> String {
 /// `<profile_dir>/deps/<name>` (the raw compiler output, refreshed on EVERY build that recompiles
 /// the lib, uplifted or not — a cdylib's filename in `deps/` is never hash-suffixed, since a single
 /// package produces at most one). A bare `cargo test` with no prior `--all-targets`/`--lib` build
-/// (exactly what `cargo mutants`'s default build step runs, and what a developer running `cargo
-/// test` alone locally gets) recompiles the mutated/edited source but does NOT uplift it — checking
-/// only `profile_dir` in that case silently finds a STALE (or absent) top-level copy and every test
-/// below no-ops via this function's `None` return, appearing to pass without exercising a single
-/// line of the real cdylib. Confirmed by hand: deleting both candidates and running the exact
-/// `cargo test` invocation `cargo-mutants` uses left `profile_dir` empty while `profile_dir/deps`
-/// held the freshly-built dylib. Preferring whichever candidate has the newer mtime (falling back to
-/// whichever exists) is correct regardless of which build step ran last.
+/// (the shape any plain `cargo test` invocation takes, including the one a developer runs locally)
+/// recompiles the edited source but does NOT uplift it, so checking only `profile_dir` in that case
+/// silently finds a STALE (or absent) top-level copy and every test below no-ops via this
+/// function's `None` return, appearing to pass without exercising a single line of the real cdylib.
+/// With both candidates deleted, a plain `cargo test` leaves `profile_dir` empty while
+/// `profile_dir/deps` holds the freshly-built dylib. Preferring whichever candidate has the newer
+/// mtime (falling back to whichever exists) is correct regardless of which build step ran last.
 fn plugin_path() -> Option<std::path::PathBuf> {
     let candidate = (|| {
         let exe = std::env::current_exe().ok()?;

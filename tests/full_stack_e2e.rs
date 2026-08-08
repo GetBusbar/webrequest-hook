@@ -104,8 +104,8 @@ fn busbar_bin() -> Option<PathBuf> {
 /// Checks BOTH the "uplifted" `<profile_dir>/<name>` copy (only refreshed when `[lib]` is a ROOT
 /// build target, e.g. `cargo build --all-targets`) and the raw `<profile_dir>/deps/<name>` compiler
 /// output (refreshed on every build that recompiles the lib) — see `tests/e2e.rs`'s `plugin_path()`
-/// doc comment for the full story: a bare `cargo test` (what `cargo-mutants` runs, and what a
-/// developer gets locally without an explicit prior build) does NOT uplift the top-level copy, so
+/// doc comment for the full story: a bare `cargo test` (what a developer gets locally without an
+/// explicit prior build) does NOT uplift the top-level copy, so
 /// checking only that path finds nothing / something stale and this test silently no-ops.
 fn webrequest_cdylib() -> Option<PathBuf> {
     let candidate = (|| {
