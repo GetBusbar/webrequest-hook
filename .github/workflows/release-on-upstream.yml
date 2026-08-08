@@ -156,6 +156,36 @@ jobs:
             *) echo "::error::dry-run: ${TAG} is not a valid semver tag"; exit 1 ;;
           esac
 
+      # Re-pinning .busbar-ref moves the SIBLING ../busbarAI checkout that every busbar-* entry in
+      # Cargo.toml is a path dependency on, and that move can change the resolved dependency graph
+      # (busbar 1.5.2 -> 1.5.3, for instance, pulled `valuable` in behind `tracing`). Cargo.lock is
+      # committed in this repo and release.yml builds with `--locked`, so a lock left describing the
+      # OLD graph makes `cargo build --locked` refuse to update it and every release target fails.
+      #
+      # So the lock is refreshed HERE, against the exact commit being pinned, and committed in the
+      # SAME commit as .busbar-ref. `--locked` in release.yml is deliberately kept: it is what
+      # guarantees a release builds exactly the graph resolved and reviewed at pin time, and dropping
+      # it would turn this loud failure into a silent drift.
+      - name: Refresh Cargo.lock against the busbar ref being pinned
+        if: steps.guard.outputs.exists == 'no' && steps.resolve.outputs.in_sha != '' && github.event.inputs.dry_run != 'true'
+        env:
+          IN_SHA: ${{ steps.resolve.outputs.in_sha }}
+        run: |
+          set -euo pipefail
+          # Cargo.toml's path deps point at ../busbarAI, a SIBLING of this checkout. actions/checkout
+          # cannot write outside the workspace, and GetBusbar/busbar is public, so clone it directly.
+          sib="$(cd .. && pwd)/busbarAI"
+          rm -rf "$sib"
+          git clone --quiet --no-checkout https://github.com/GetBusbar/busbar.git "$sib"
+          git -C "$sib" checkout --quiet "${IN_SHA}"
+          # Plain cargo (NO --locked) performs the MINIMAL resolution: every existing registry pin is
+          # preserved and only what the new busbar graph actually requires is added or moved.
+          cargo metadata --format-version 1 >/dev/null
+          # Prove the refreshed lock satisfies the exact flag release.yml will build under, BEFORE we
+          # commit and tag. If this fails, no tag is pushed and no phantom release can be created.
+          cargo metadata --format-version 1 --locked >/dev/null
+          echo "::notice::Cargo.lock is fresh against busbar ${IN_SHA} and satisfies --locked"
+
       - name: Record the new busbar ref in .busbar-ref
         if: steps.guard.outputs.exists == 'no' && steps.resolve.outputs.in_sha != '' && github.event.inputs.dry_run != 'true'
         env:
@@ -165,10 +195,12 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s %s\n' "${IN_SHA}" "${IN_VER}" > .busbar-ref
-          if git diff --quiet .busbar-ref; then
-            echo "::notice::.busbar-ref already at ${IN_SHA} ${IN_VER}, no commit needed"
+          # Cargo.lock rides along with the ref it was resolved against: the two must never be
+          # committed apart, or release.yml's --locked build sees a lock for a different busbar.
+          if git diff --quiet -- .busbar-ref Cargo.lock; then
+            echo "::notice::.busbar-ref already at ${IN_SHA} ${IN_VER} and Cargo.lock already fresh, no commit needed"
           else
-            git add .busbar-ref
+            git add .busbar-ref Cargo.lock
             git commit -m ".busbar-ref: record busbar ${IN_VER} (${IN_SHA}) for the ${TAG} release"
             git push origin HEAD:main
           fi

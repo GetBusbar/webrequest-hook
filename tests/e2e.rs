@@ -306,8 +306,8 @@ fn cand(idx: usize) -> Candidate<'static> {
         available_concurrency: 1,
         budget_remaining: None,
         rate_headroom: None,
-        // Candidate-phase declared signals: empty, same reason as the request bag above.
-        signals: Default::default(),
+        // Same contract as RoutingRequest::signals above: empty unless a consumer declares one.
+        signals: busbar_api::SignalBag::new(),
     }
 }
 
