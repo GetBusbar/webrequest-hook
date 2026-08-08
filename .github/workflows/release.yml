@@ -31,18 +31,25 @@ permissions:
 jobs:
   # Create the Release first so the parallel per-target upload jobs have something to attach to
   # (uploading from a matrix without a pre-existing release races -> "release not found").
+  #
+  # It is created as a DRAFT. A draft is addressable by tag to `gh release upload` / `gh release
+  # view` with this token, but it is NOT returned by the public `releases/latest` or
+  # `releases/tags/<tag>` endpoints -- so while the build matrix is still running, and for good if it
+  # fails, nothing following `releases/latest` can observe an assetless release. `verify-assets`
+  # publishes it only once assets are actually attached, which is what makes a release here either
+  # complete or absent, never an empty shell.
   create-release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Create GitHub Release
+      - name: Create GitHub Release (draft)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "busbar-webrequest ${GITHUB_REF_NAME}" \
-            --verify-tag --generate-notes \
+            --draft --verify-tag --generate-notes \
           || gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}"
 
   # One signed .tar.gz per target: {cdylib + manifest.json}, packed by busbar-plugin-pack and
@@ -153,19 +160,20 @@ jobs:
         with:
           subject-path: "plugin-dist/*.tar.gz"
 
-  # PHANTOM-RELEASE GUARD: assert the published Release actually carries assets before we treat this
-  # as a real release. The per-target build/upload jobs run with fail-fast:false, and `create-release`
-  # always makes the (initially empty) Release up front — so a build/pack failure on EVERY target
-  # (e.g. a stale Cargo.lock tripping `--locked`, as happened on the first v1.0.3 cut) leaves a tag +
-  # Release with ZERO assets: a "phantom" that silently breaks busbar's plugin-registry-gate. This job
-  # fails the whole release run loud if assets == 0, so a phantom can never ship (or notify marketing)
-  # unnoticed again. It depends on the build matrix but does NOT inherit its fail-fast:false — one
-  # green target is enough to have assets, but zero across the board must hard-fail here.
+  # PHANTOM-RELEASE GATE: this is the only step that turns the draft into a published release, and it
+  # does so only after proving assets are attached. The per-target build/upload jobs run with
+  # fail-fast:false and `create-release` makes the (initially empty) Release up front, so a build/pack
+  # failure on EVERY target (e.g. a stale Cargo.lock tripping `--locked`) leaves a Release with ZERO
+  # assets. Previously that Release was published immediately and such a failure shipped a "phantom":
+  # a tag whose `releases/latest` carried nothing, silently breaking busbar's plugin-registry-gate.
+  # Now the empty Release is a draft nothing can resolve, and this job either publishes it or fails
+  # the run with the draft left unpublished. It depends on the build matrix but does NOT inherit its
+  # fail-fast:false: one green target is enough to have assets, zero across the board must hard-fail.
   verify-assets:
     needs: [webrequest-plugin]
     runs-on: ubuntu-latest
     steps:
-      - name: Assert the Release has at least one asset
+      - name: Assert the Release has at least one asset, then publish it
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -175,13 +183,19 @@ jobs:
             --json assets --jq '.assets | length')"
           echo "Release ${GITHUB_REF_NAME} has ${count} asset(s)."
           if [ "${count}" -eq 0 ]; then
-            echo "::error::PHANTOM RELEASE: ${GITHUB_REF_NAME} was published with 0 assets." \
-                 "Every build/pack target failed to upload a tarball. Failing the release run so this" \
-                 "tag is not mistaken for a real release by busbar's plugin-registry-gate. Fix the" \
-                 "build (check Cargo.lock freshness vs --locked and the plugin cdylib build step)," \
-                 "delete this tag+release, and re-cut." >&2
+            echo "::error::PHANTOM RELEASE PREVENTED: ${GITHUB_REF_NAME} has 0 assets." \
+                 "Every build/pack target failed to upload a tarball. The release is still a DRAFT," \
+                 "so it was never visible to anything following releases/latest and there is no" \
+                 "phantom to clean up -- just fix the build (check Cargo.lock freshness vs --locked" \
+                 "and the plugin cdylib build step) and re-run. Failing the release run." >&2
             exit 1
           fi
+          # Only now, with assets provably attached, does this stop being a draft and become the
+          # release that `releases/latest` resolves to.
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false --latest
+          echo "::notice::Published ${GITHUB_REF_NAME} with ${count} asset(s)."
 
   # Instant marketing-site rebuild the moment this plugin ships a real release -- marketing's
   # deploy.yml listens for this exact repository_dispatch event type (plus its own daily-poll
