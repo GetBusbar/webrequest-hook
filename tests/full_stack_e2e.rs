@@ -327,15 +327,20 @@ mockup:
     // `auth.chain: []` (open relay) on purpose: this test's whole point is the admin-install ->
     // plugin-load -> hook-invocation -> webhook round trip, not the client auth chain (covered
     // elsewhere in busbar's own suite) — narrowing scope here keeps the failure surface honest.
+    //
+    // `admin-tokens` is DEFINED once under `identity-providers:` and REFERENCED by bare name from
+    // `auth.admin_auth`. busbar 1.5.3 retired the inline-module form this used to use, and refuses
+    // to boot a config still carrying it, so the inline shape would fail this test at startup.
     let config_yaml = format!(
         r#"
 listen: "127.0.0.1:{data_port}"
 admin_listen: "127.0.0.1:{admin_port}"
+identity-providers:
+  admin-tokens: {{ module: admin-tokens, token: {{ env: BUSBAR_E2E_ADMIN_TOKEN }} }}
 auth:
   chain: []
   signing_key: {{ env: BUSBAR_SIGNING_KEY }}
-  admin_auth:
-    - admin-tokens: {{ token: {{ env: BUSBAR_E2E_ADMIN_TOKEN }} }}
+  admin_auth: [admin-tokens]
 plugins:
   enabled: true
   dir: "{plugins_dir}"

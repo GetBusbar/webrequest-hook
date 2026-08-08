@@ -267,6 +267,11 @@ fn cfg(url: &str) -> String {
 
 fn req_with_prompt(text: &str) -> RoutingRequest<'static> {
     RoutingRequest {
+        // busbar 1.5.3 added the correlation id and the declared-signal bag to the hook projection.
+        // These fixtures pin a fixed id and an EMPTY bag: no test here declares a signal, and an
+        // empty bag serialises to nothing, so the forwarded envelope is unchanged by their presence.
+        request_id: 1,
+        signals: busbar_api::SignalBag::new(),
         pool: "p",
         ingress_protocol: "anthropic",
         requested_model: None,
@@ -299,6 +304,8 @@ fn cand(idx: usize) -> Candidate<'static> {
         available_concurrency: 1,
         budget_remaining: None,
         rate_headroom: None,
+        // Same contract as RoutingRequest::signals above: empty unless a consumer declares one.
+        signals: busbar_api::SignalBag::new(),
     }
 }
 
