@@ -24,9 +24,12 @@
 //!   3. `POST /api/v1/admin/plugins` the signed tarball — confirm `201` + `trust: "trusted"`.
 //!   4. `POST /api/v1/admin/plugins/reload` — confirm the plugin registry picks it up.
 //!   5. `POST /api/v1/admin/hooks` — register a `global` tap naming this plugin's alias
-//!      (`webrequest`), `settings.url` pointing at a local mock HTTP server standing in for the
-//!      operator's webhook target (this repo's own established mocking convention — see
-//!      `tests/e2e.rs`'s `mock_target`/`capturing_target`).
+//!      (`webrequest`), pinned to the REQUEST stage with `at: "request"`, `settings.url` pointing
+//!      at a local mock HTTP server standing in for the operator's webhook target (this repo's own
+//!      established mocking convention, see `tests/e2e.rs`'s `mock_target`/`capturing_target`).
+//!      The stage pin is deliberate and documented at the registration site: since busbar 1.5.3 an
+//!      unscoped hook fires at every core stage, and only the request-stage envelope carries prompt
+//!      content. `tests/stage_fanout_e2e.rs` covers the unscoped, all-stages case.
 //!   6. `POST /{model}/v1/messages` — a real Anthropic-shaped chat request through the real router,
 //!      against a real (mocked) upstream model.
 //!   7. Confirm the mock webhook server received a REAL POST with the REAL engine-built envelope
@@ -104,8 +107,8 @@ fn busbar_bin() -> Option<PathBuf> {
 /// Checks BOTH the "uplifted" `<profile_dir>/<name>` copy (only refreshed when `[lib]` is a ROOT
 /// build target, e.g. `cargo build --all-targets`) and the raw `<profile_dir>/deps/<name>` compiler
 /// output (refreshed on every build that recompiles the lib) — see `tests/e2e.rs`'s `plugin_path()`
-/// doc comment for the full story: a bare `cargo test` (what `cargo-mutants` runs, and what a
-/// developer gets locally without an explicit prior build) does NOT uplift the top-level copy, so
+/// doc comment for the full story: a bare `cargo test` (what a developer gets locally without an
+/// explicit prior build) does NOT uplift the top-level copy, so
 /// checking only that path finds nothing / something stale and this test silently no-ops.
 fn webrequest_cdylib() -> Option<PathBuf> {
     let candidate = (|| {
@@ -281,6 +284,61 @@ async fn wait_for_healthz(admin_addr: &str) {
     }
 }
 
+/// Poll the captured-webhook sink until the observed CALL COUNT has stopped moving, then return the
+/// settled batch. Returns as soon as a non-zero count has held steady across [`STABLE_POLLS`]
+/// consecutive polls; panics only if NOTHING ever arrived within `timeout`.
+///
+/// Why a settle and not a "first non-empty wins" read: a tap is fire-and-forget. Busbar spawns the
+/// POST on a detached task and never awaits it, so the calls for a single request land over a short
+/// window with no ordering or delivery guarantee. Reading the sink the instant it turns non-empty
+/// samples the MIDDLE of that window, which makes any assertion about the batch (its size, which
+/// stages are in it, which envelope carries what) a coin flip that usually lands the way the author
+/// expected. Requiring the count to hold still first turns "we looked too early" into a real,
+/// reproducible observation.
+///
+/// A late arrival resets the streak, so an EXTRA call is surfaced to the caller's assertion rather
+/// than raced past. On timeout with at least one call in hand, the settled-so-far batch is returned
+/// and the caller's own assertion reports the mismatch (a more useful failure than a generic
+/// timeout); with zero calls it panics, preserving the original "the chain never completed"
+/// diagnostic.
+async fn settle_captured(
+    captured: &Arc<Mutex<Vec<serde_json::Value>>>,
+    timeout: Duration,
+) -> Vec<serde_json::Value> {
+    /// Gap between polls.
+    const POLL: Duration = Duration::from_millis(100);
+    /// Consecutive equal, non-zero counts required before the batch is considered settled.
+    const STABLE_POLLS: u32 = 5;
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_len = 0usize;
+    let mut stable = 0u32;
+    loop {
+        tokio::time::sleep(POLL).await;
+        let len = captured.lock().unwrap().len();
+        if len > 0 && len == last_len {
+            stable += 1;
+            if stable >= STABLE_POLLS {
+                return captured.lock().unwrap().clone();
+            }
+        } else {
+            // Growth (or still nothing): restart the streak against the new count.
+            stable = 0;
+            last_len = len;
+        }
+        if std::time::Instant::now() > deadline {
+            if last_len > 0 {
+                return captured.lock().unwrap().clone();
+            }
+            panic!(
+                "the mock webhook target never received a call from the real, admin-API-installed \
+                 webrequest hook within {timeout:?}: the real install -> load -> invoke -> webhook \
+                 chain did not complete"
+            );
+        }
+    }
+}
+
 /// THE full-stack proof. `#[ignore]`-free and part of the normal `cargo test` run: this is the
 /// "prod ready" bar, not an opt-in extra.
 #[tokio::test(flavor = "multi_thread")]
@@ -450,12 +508,33 @@ models:
     // than a listing row would be.
 
     // ── 6. Register a global hook naming this plugin, over the REAL admin API ───────────────────
+    // `at: "request"` PINS this tap to the request stage, and it is load-bearing for the
+    // exactly-one-call assertion below. Busbar 1.5.3 made an unscoped hook fire at EVERY core
+    // stage (request, candidate, routing, response) instead of once per request:
+    //
+    //   busbarAI CHANGELOG.md, "[1.5.3] Breaking changes":
+    //     "A hand-written hook with no stage list now fires at all four stages rather than once
+    //      per request; set `phase: [request]` for the old behaviour."
+    //
+    // `phase:` is the config-file spelling of that opt-out; on THIS surface, the admin API, the
+    // equivalent is the single-valued `at:` (busbar resolves a hook's stages as: a non-empty
+    // `phase:` list wins, else the single `at:`, else all four core stages - see
+    // `HookCfg::fires_at_stage` in the engine). Without the pin this tap observes four envelopes
+    // and only one of them carries prompt text, which is not what this test is here to prove.
+    //
+    // What this test proves is the REQUEST-stage envelope specifically: that the real engine's own
+    // wire projection, carrying real prompt content under the `prompt: ro` grant, reached a real
+    // webhook target through a real admin-API plugin install. The candidate/routing/response
+    // envelopes are shape-only by construction (the engine sends no prompt, no identity, no
+    // candidates on them), so they cannot carry that proof. `tests/stage_fanout_e2e.rs` is the
+    // test that covers them, asserting the 1.5.3 fan-out positively.
     let hook_body = serde_json::json!({
         "name": "webrequest-e2e-tap",
         "config": {
             "kind": "tap",
             "plugin": "webrequest",
             "global": true,
+            "at": "request",
             "prompt": "ro",
             "settings": { "url": webhook_url },
         }
@@ -520,26 +599,25 @@ models:
     );
 
     // ── 8. Confirm the mock webhook ACTUALLY received the real HTTP round trip ──────────────────
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let received = loop {
-        let snapshot = captured.lock().unwrap().clone();
-        if !snapshot.is_empty() {
-            break snapshot;
-        }
-        if std::time::Instant::now() > deadline {
-            panic!(
-                "the mock webhook target never received a call from the real, admin-API-installed \
-                 webrequest hook within 10s — the real install -> load -> invoke -> webhook chain \
-                 did not complete"
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    // SETTLE, do not break on the first sighting. A tap is fire-and-forget: busbar spawns the POST
+    // detached and never waits for it, so the deliveries for one request land over a short window
+    // and `captured` grows asynchronously. A loop that stopped as soon as the vec was non-empty
+    // read a partially delivered batch, which is why the stale `len() == 1` assertion below could
+    // pass by accident on slow delivery: it was not really guarding the count at all, it was
+    // guarding "at least one call arrived, and we looked before the rest showed up".
+    //
+    // So: wait for at least one call, then require the count to hold steady across consecutive
+    // polls before trusting it. Any late arrival resets the streak, so an extra envelope is
+    // observed and fails the assertion instead of being raced past.
+    let received = settle_captured(&captured, Duration::from_secs(10)).await;
 
     assert_eq!(
         received.len(),
         1,
-        "exactly one real webhook call expected for one real request: {received:?}"
+        "exactly one real webhook call expected for one real request: a hook pinned to the \
+         request stage (`at: \"request\"`) observes each request once. More than one here means \
+         the stage pin stopped taking effect and this tap is seeing busbar 1.5.3's per-stage \
+         fan-out: {received:?}"
     );
     let envelope = &received[0];
     assert_eq!(
