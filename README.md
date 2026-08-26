@@ -1,5 +1,7 @@
 # webrequest-hook
 
+[![Coverage](https://codecov.io/gh/GetBusbar/webrequest-hook/branch/dev/graph/badge.svg)](https://codecov.io/gh/GetBusbar/webrequest-hook)
+
 **v1.5.0.** The first-party, signed `kind: hook` plugin for
 [busbar](https://getbusbar.com): a transparent HTTP forwarder that POSTs
 each hook op envelope (`decide` / `transform` / `notify` / `configure` /
