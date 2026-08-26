@@ -1,5 +1,9 @@
 # webrequest-hook
 
+[![CI](https://github.com/GetBusbar/webrequest-hook/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/webrequest-hook/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/GetBusbar/webrequest-hook/branch/main/graph/badge.svg)](https://codecov.io/gh/GetBusbar/webrequest-hook)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 **v1.5.0.** The first-party, signed `kind: hook` plugin for
 [busbar](https://getbusbar.com): a transparent HTTP forwarder that POSTs
 each hook op envelope (`decide` / `transform` / `notify` / `configure` /
